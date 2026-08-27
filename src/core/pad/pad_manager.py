@@ -50,14 +50,16 @@ class PADManager:
     def active_engine(self) -> BasePADEngine:
         if self._active_model_name not in self._engines:
             self._engines[self._active_model_name] = self.AVAILABLE_MODELS[self._active_model_name]()
-            self._engines[self._active_model_name].initialize()
         return self._engines[self._active_model_name]
 
     def initialize(self) -> bool:
         """Initializes the default active PAD engine."""
         try:
             engine = self.active_engine
-            self._is_ready = engine.initialize()
+            if not engine.is_ready:
+                self._is_ready = engine.initialize()
+            else:
+                self._is_ready = True
             logger.info(f"PAD Manager initialized with active model: '{self._active_model_name}'")
             return self._is_ready
         except Exception as e:
@@ -74,7 +76,9 @@ class PADManager:
         self._active_model_name = model_name
         engine = self.active_engine
         if not engine.is_ready:
-            engine.initialize()
+            self._is_ready = engine.initialize()
+        else:
+            self._is_ready = True
         logger.info(f"PAD active engine switched to: '{model_name}' ({engine.model_name})")
         return True
 

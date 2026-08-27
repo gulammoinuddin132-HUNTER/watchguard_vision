@@ -291,7 +291,7 @@ class BlinkEARPADEngine(BasePADEngine):
         # Multi-face track registry
         self._tracks: Dict[int, TrackedFacePADState] = {}
         self._next_track_id: int = 1
-        self._is_ready = True
+        self._is_ready = False
 
     @property
     def model_name(self) -> str:
@@ -759,14 +759,6 @@ class BlinkEARPADEngine(BasePADEngine):
             warmup_active=is_warmup_final,
             stable_state=stable_state.value,
             history_symbols=track.stabilizer.history_symbols,
-        )
-
-        logger.debug(
-            f"[PAD STABILIZER Track #{track.track_id}] Raw={raw_decision_tag}({raw_confidence:.2f}) | "
-            f"Hist=[{track.stabilizer.history_symbols}] | Stable={stable_state.value} ({stable_conf:.2f}) | "
-            f"atk={stable_atk.value} blinks={track.blink_count} ratio_std={ratio_motion_std:.4f} "
-            f"norm_std={norm_motion_std:.4f} screen={track.is_inside_screen} ({track.screen_object_label}) "
-            f"elapsed={elapsed_seconds:.1f}s"
         )
 
         return PADResult(

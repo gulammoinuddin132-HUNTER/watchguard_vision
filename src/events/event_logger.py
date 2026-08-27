@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 from typing import Callable, List, Optional, Dict, Any
 
-from config import LOG_FILE_PATH
+from config import LOG_FILE_PATH, CONSOLE_LOG_LEVEL, FILE_LOG_LEVEL
 from src.database.db_manager import DatabaseManager
 from src.events.event_types import EventType, RiskLevel
 
@@ -18,10 +18,17 @@ from src.events.event_types import EventType, RiskLevel
 class EventLogger:
     """Centralized event logger for WatchGuard Vision."""
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(
+        self,
+        db_manager: Optional[DatabaseManager] = None,
+        log_file_path: Optional[Path] = LOG_FILE_PATH,
+        attach_handlers: bool = True,
+    ):
         self.db_manager = db_manager or DatabaseManager()
+        self.log_file_path = log_file_path
         self._subscribers: List[Callable[[Dict[str, Any]], None]] = []
-        self._setup_file_logging()
+        if attach_handlers:
+            self._setup_file_logging()
 
     def _setup_file_logging(self) -> None:
         """Sets up Python logging to file and stdout."""
@@ -30,15 +37,20 @@ class EventLogger:
 
         if not self.logger.handlers:
             # File Handler
-            file_handler = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
-            file_formatter = logging.Formatter(
-                "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
-            )
-            file_handler.setFormatter(file_formatter)
-            self.logger.addHandler(file_handler)
+            if self.log_file_path:
+                file_level = getattr(logging, str(FILE_LOG_LEVEL).upper(), logging.INFO)
+                file_handler = logging.FileHandler(str(self.log_file_path), encoding="utf-8")
+                file_handler.setLevel(file_level)
+                file_formatter = logging.Formatter(
+                    "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+                )
+                file_handler.setFormatter(file_formatter)
+                self.logger.addHandler(file_handler)
 
             # Stream Handler (console)
+            console_level = getattr(logging, str(CONSOLE_LOG_LEVEL).upper(), logging.INFO)
             stream_handler = logging.StreamHandler(sys.stdout)
+            stream_handler.setLevel(console_level)
             stream_formatter = logging.Formatter(
                 "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
             )
@@ -93,7 +105,7 @@ class EventLogger:
         elif r_level == "YELLOW":
             self.logger.info(log_msg)
         else:
-            self.logger.debug(log_msg)
+            self.logger.info(log_msg)
 
         event_payload = {
             "id": event_id,

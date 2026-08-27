@@ -109,6 +109,8 @@ CAMERA_WARMUP_FRAMES = 5
 
 # Event & Logging
 LOG_FILE_PATH = LOGS_DIR / "watchguard.log"
+CONSOLE_LOG_LEVEL = os.getenv("CONSOLE_LOG_LEVEL", "INFO")
+FILE_LOG_LEVEL = os.getenv("FILE_LOG_LEVEL", "INFO")
 MAX_RECENT_EVENTS_DISPLAY = 100
 
 # Risk Thresholds

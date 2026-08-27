@@ -353,27 +353,17 @@ class PersonRecognitionEngine(BaseVisionEngine):
             # --- Joint Identity ⊗ Liveness Access Evaluation ---
             joint_decision = JointAccessEvaluator.evaluate(identity_dict, pad_result)
 
-            # Track State Transition for Traceability
+            # Track State Transition for Traceability (Logged only when state changes)
             person_track_key = f"{name}#T{track_id}"
             prev_state = self._previous_person_states.get(person_track_key, "NONE")
             curr_state = joint_decision.status.value
-            if is_known and prev_state != curr_state:
-                transition_str = f"{prev_state} -> {curr_state}" if prev_state != "NONE" else f"IDENTITY_MATCHED -> {curr_state}"
-                logger.info(f"[STATE_TRANSITION Track #{track_id}] User='{name}': {transition_str}")
+            if prev_state != curr_state:
+                transition_str = f"{prev_state} -> {curr_state}" if prev_state != "NONE" else f"INITIAL_OBSERVATION -> {curr_state}"
+                logger.info(
+                    f"[STATE_TRANSITION Track #{track_id}] Identity='{name}' (Sim={match_pct}%): {transition_str} | "
+                    f"Access={joint_decision.status.display_label} (Risk={joint_decision.risk_level.value})"
+                )
                 self._previous_person_states[person_track_key] = curr_state
-
-            hist_symbols = pad_result.metadata.get("history_symbols", "")
-            stable_st = pad_result.metadata.get("stable_state", "UNKNOWN")
-            raw_tag_str = pad_result.metadata.get("raw_tag", "UNKNOWN")
-
-            logger.info(
-                f"[PAD STABILIZER T#{track_id}] Identity='{name}' (Sim={match_pct}%) | "
-                f"PAD Score={pad_result.confidence:.2f} ({int(pad_result.confidence*100)}%) | "
-                f"RawTag={raw_tag_str} | "
-                f"Hist=[{hist_symbols}] | "
-                f"StableState={stable_st} | "
-                f"Access={joint_decision.status.display_label} (Risk={joint_decision.risk_level.value})"
-            )
 
             people.append(
                 {
