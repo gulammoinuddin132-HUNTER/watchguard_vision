@@ -1,5 +1,18 @@
 # WatchGuard Vision 👁️
 **Context-Aware AI Visual Security Assistant**
+Gulam Moinuddin
+B.Tech CSE (Business Systems)
+
+AI • Computer Vision • Software Engineering
+
+Featured Projects
+├── WatchGuard Vision
+├── CareSync
+├── Migration Pressure Index
+└── Hidden Genius
+
+Tech
+Python • C++ • Java • SQL • OpenCV • YOLO • ONNX
 
 WatchGuard Vision is an intelligent security operations platform and desktop visual assistant. It evolves standard computer vision security into a multi-modal context engine capable of analyzing person identity, object presence, location/surveillance zones, operational time windows, and configurable security policy rules in real-time.
 
