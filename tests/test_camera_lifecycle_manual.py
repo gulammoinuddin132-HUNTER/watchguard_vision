@@ -58,10 +58,16 @@ class TestCameraLifecycleManual(unittest.TestCase):
         )
 
     def tearDown(self):
+        if hasattr(self, "app") and self.app:
+            try:
+                self.app.close(destroy_root=False)
+            except Exception:
+                pass
         if self.camera_manager.is_running:
             self.camera_manager.stop()
         try:
-            self.root.destroy()
+            if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                self.root.destroy()
         except Exception:
             pass
 

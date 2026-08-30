@@ -5,6 +5,7 @@ Thread-safe connection handling, table initialization, and structured CRUD opera
 for WatchGuard Vision.
 """
 
+import logging
 import shutil
 import sqlite3
 import threading
@@ -13,6 +14,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Generator
 
+logger = logging.getLogger("WatchGuardVision.DatabaseManager")
+
 from config import (
     DATABASE_PATH,
     DATA_DIR,
@@ -20,6 +23,8 @@ from config import (
     FACES_DIR,
     MODELS_DIR,
     DEMO_FACES_DIR,
+    MAX_DATABASE_NORMAL_EVENTS,
+    EVENT_RETENTION_CHECK_INTERVAL,
 )
 from src.database.models import (
     User,
@@ -38,7 +43,8 @@ class DatabaseManager:
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = Path(db_path or DATABASE_PATH)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._event_insert_counter: int = 0
         self._initialize_schema()
 
     @contextmanager
@@ -232,7 +238,53 @@ class DatabaseManager:
                     ),
                 )
                 conn.commit()
-                return cursor.lastrowid
+                event_id = cursor.lastrowid
+
+            # Periodic non-critical event retention check (throttled by insert interval, never per-frame)
+            self._event_insert_counter += 1
+            if self._event_insert_counter % EVENT_RETENTION_CHECK_INTERVAL == 0:
+                try:
+                    self.enforce_event_retention(max_normal_events=MAX_DATABASE_NORMAL_EVENTS)
+                except Exception:
+                    pass
+
+            return event_id
+
+    def enforce_event_retention(self, max_normal_events: Optional[int] = None) -> int:
+        """
+        Enforces database event retention policy:
+        - Keeps at most max_normal_events (default 500) normal/non-critical events (risk_level = 'GREEN').
+        - Automatically deletes the oldest eligible non-critical events beyond the limit.
+        - Strictly protects critical events (ORANGE, RED).
+        - Strictly protects events associated with active (unresolved) security incidents.
+        - Returns the number of pruned event records.
+        """
+        limit = max_normal_events if max_normal_events is not None else MAX_DATABASE_NORMAL_EVENTS
+        if limit <= 0:
+            return 0
+
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                # Find and delete oldest GREEN events beyond the limit,
+                # explicitly protecting any event associated with an active/unresolved incident
+                delete_sql = """
+                    DELETE FROM security_events
+                    WHERE id IN (
+                        SELECT id FROM security_events
+                        WHERE risk_level = 'GREEN'
+                          AND id NOT IN (
+                              SELECT event_id FROM security_incidents
+                              WHERE event_id IS NOT NULL AND state != 'RESOLVED'
+                          )
+                        ORDER BY id DESC
+                        LIMIT -1 OFFSET ?
+                    )
+                """
+                cursor.execute(delete_sql, (limit,))
+                deleted_count = cursor.rowcount
+                conn.commit()
+                return max(0, deleted_count)
 
     def get_recent_security_events(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Fetches the most recent security events."""
@@ -531,39 +583,42 @@ class DatabaseManager:
 
     def get_incident_by_id(self, incident_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves a single incident by its unique incident_id."""
-        with self._connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM security_incidents WHERE incident_id = ?",
-                (incident_id,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM security_incidents WHERE incident_id = ?",
+                    (incident_id,),
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
 
     def get_active_incidents(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Returns unresolved incidents (DETECTED, VERIFIED, ALERTED, ACKNOWLEDGED) ordered newest first."""
-        with self._connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT * FROM security_incidents
-                WHERE state != 'RESOLVED'
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-            return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT * FROM security_incidents
+                    WHERE state != 'RESOLVED'
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                return [dict(row) for row in cursor.fetchall()]
 
     def get_latest_incident(self) -> Optional[Dict[str, Any]]:
         """Returns the most recent security incident regardless of state."""
-        with self._connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM security_incidents ORDER BY created_at DESC LIMIT 1"
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM security_incidents ORDER BY created_at DESC LIMIT 1"
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
 
     def acknowledge_incident(
         self,
@@ -647,15 +702,16 @@ class DatabaseManager:
 
     def get_incident_stats(self) -> Dict[str, int]:
         """Returns counts of incidents grouped by state."""
-        with self._connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT state, COUNT(*) as cnt FROM security_incidents GROUP BY state"
-            )
-            stats = {row["state"]: row["cnt"] for row in cursor.fetchall()}
-            cursor.execute("SELECT COUNT(*) FROM security_incidents")
-            stats["TOTAL"] = cursor.fetchone()[0]
-            return stats
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT state, COUNT(*) as cnt FROM security_incidents GROUP BY state"
+                )
+                stats = {row["state"]: row["cnt"] for row in cursor.fetchall()}
+                cursor.execute("SELECT COUNT(*) FROM security_incidents")
+                stats["TOTAL"] = cursor.fetchone()[0]
+                return stats
 
     def get_analytics_counts(
         self,
@@ -682,141 +738,143 @@ class DatabaseManager:
         time_clause_incidents = "WHERE created_at >= ?" if cutoff_iso else ""
         params_incidents = (cutoff_iso,) if cutoff_iso else ()
 
-        with self._connection() as conn:
-            cursor = conn.cursor()
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
 
-            # Active incidents (state != 'RESOLVED')
-            cursor.execute(
-                "SELECT COUNT(*) FROM security_incidents WHERE state != 'RESOLVED'"
-            )
-            active_incidents = cursor.fetchone()[0]
-
-            # Resolved incidents in window
-            if cutoff_iso:
+                # Active incidents (state != 'RESOLVED')
                 cursor.execute(
-                    "SELECT COUNT(*) FROM security_incidents WHERE state = 'RESOLVED' AND updated_at >= ?",
-                    (cutoff_iso,),
+                    "SELECT COUNT(*) FROM security_incidents WHERE state != 'RESOLVED'"
                 )
-            else:
-                cursor.execute(
-                    "SELECT COUNT(*) FROM security_incidents WHERE state = 'RESOLVED'"
-                )
-            resolved_incidents = cursor.fetchone()[0]
+                active_incidents = cursor.fetchone()[0]
 
-            # Spoof attempts
-            spoof_sql = f"""
-                SELECT COUNT(*) FROM security_events
-                {time_clause_events}
-                {'AND' if time_clause_events else 'WHERE'}
-                (event_type LIKE '%SPOOF%' OR event_type LIKE '%PRESENTATION_ATTACK%' OR description LIKE '%spoof%' OR description LIKE '%presentation attack%')
-            """
-            cursor.execute(spoof_sql, params_events)
-            spoof_attempts = cursor.fetchone()[0]
+                # Resolved incidents in window
+                if cutoff_iso:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM security_incidents WHERE state = 'RESOLVED' AND updated_at >= ?",
+                        (cutoff_iso,),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM security_incidents WHERE state = 'RESOLVED'"
+                    )
+                resolved_incidents = cursor.fetchone()[0]
 
-            # After-hours violations
-            after_hours_sql = f"""
-                SELECT COUNT(*) FROM security_events
-                {time_clause_events}
-                {'AND' if time_clause_events else 'WHERE'}
-                (event_type LIKE '%AFTER_HOURS%' OR description LIKE '%after-hours%' OR description LIKE '%operating hours%')
-            """
-            cursor.execute(after_hours_sql, params_events)
-            after_hours_violations = cursor.fetchone()[0]
+                # Spoof attempts
+                spoof_sql = f"""
+                    SELECT COUNT(*) FROM security_events
+                    {time_clause_events}
+                    {'AND' if time_clause_events else 'WHERE'}
+                    (event_type LIKE '%SPOOF%' OR event_type LIKE '%PRESENTATION_ATTACK%' OR description LIKE '%spoof%' OR description LIKE '%presentation attack%')
+                """
+                cursor.execute(spoof_sql, params_events)
+                spoof_attempts = cursor.fetchone()[0]
 
-            # Restricted zone entries
-            zone_entries_sql = f"""
-                SELECT COUNT(*) FROM security_events
-                {time_clause_events}
-                {'AND' if time_clause_events else 'WHERE'}
-                (event_type LIKE '%RESTRICTED%' OR description LIKE '%Restricted Area%' OR metadata_json LIKE '%Restricted Area%')
-            """
-            cursor.execute(zone_entries_sql, params_events)
-            restricted_zone_entries = cursor.fetchone()[0]
+                # After-hours violations
+                after_hours_sql = f"""
+                    SELECT COUNT(*) FROM security_events
+                    {time_clause_events}
+                    {'AND' if time_clause_events else 'WHERE'}
+                    (event_type LIKE '%AFTER_HOURS%' OR description LIKE '%after-hours%' OR description LIKE '%operating hours%')
+                """
+                cursor.execute(after_hours_sql, params_events)
+                after_hours_violations = cursor.fetchone()[0]
 
-            # Unknown visitors
-            unknown_sql = f"""
-                SELECT COUNT(DISTINCT id)
-                FROM security_events
-                {time_clause_events}
-                {'AND' if time_clause_events else 'WHERE'}
-                (person_name IS NULL OR person_name = '' OR person_name = 'Unknown' OR event_type LIKE '%UNKNOWN%' OR description LIKE '%unregistered%' OR description LIKE '%unknown%')
-            """
-            cursor.execute(unknown_sql, params_events)
-            unknown_visitors = cursor.fetchone()[0]
+                # Restricted zone entries
+                zone_entries_sql = f"""
+                    SELECT COUNT(*) FROM security_events
+                    {time_clause_events}
+                    {'AND' if time_clause_events else 'WHERE'}
+                    (event_type LIKE '%RESTRICTED%' OR description LIKE '%Restricted Area%' OR metadata_json LIKE '%Restricted Area%')
+                """
+                cursor.execute(zone_entries_sql, params_events)
+                restricted_zone_entries = cursor.fetchone()[0]
 
-            # Distinct people seen
-            distinct_sql = f"""
-                SELECT COUNT(DISTINCT CASE 
-                    WHEN person_name IS NOT NULL AND person_name != '' AND person_name != 'Unknown' THEN person_name 
-                    ELSE 'EVENT_' || id 
-                END)
-                FROM security_events
-                {time_clause_events}
-                {'AND' if time_clause_events else 'WHERE'}
-                (event_type NOT LIKE '%CAMERA%' AND event_type NOT LIKE '%VOICE%')
-            """
-            cursor.execute(distinct_sql, params_events)
-            distinct_people_seen = cursor.fetchone()[0]
+                # Unknown visitors
+                unknown_sql = f"""
+                    SELECT COUNT(DISTINCT id)
+                    FROM security_events
+                    {time_clause_events}
+                    {'AND' if time_clause_events else 'WHERE'}
+                    (person_name IS NULL OR person_name = '' OR person_name = 'Unknown' OR event_type LIKE '%UNKNOWN%' OR description LIKE '%unregistered%' OR description LIKE '%unknown%')
+                """
+                cursor.execute(unknown_sql, params_events)
+                unknown_visitors = cursor.fetchone()[0]
 
-            # Authorized people seen
-            auth_sql = f"""
-                SELECT COUNT(DISTINCT person_name)
-                FROM security_events
-                {time_clause_events}
-                {'AND' if time_clause_events else 'WHERE'}
-                (risk_level = 'GREEN' AND person_name IS NOT NULL AND person_name != '' AND person_name != 'Unknown')
-            """
-            cursor.execute(auth_sql, params_events)
-            authorized_people_seen = cursor.fetchone()[0]
+                # Distinct people seen
+                distinct_sql = f"""
+                    SELECT COUNT(DISTINCT CASE 
+                        WHEN person_name IS NOT NULL AND person_name != '' AND person_name != 'Unknown' THEN person_name 
+                        ELSE 'EVENT_' || id 
+                    END)
+                    FROM security_events
+                    {time_clause_events}
+                    {'AND' if time_clause_events else 'WHERE'}
+                    (event_type NOT LIKE '%CAMERA%' AND event_type NOT LIKE '%VOICE%')
+                """
+                cursor.execute(distinct_sql, params_events)
+                distinct_people_seen = cursor.fetchone()[0]
 
-            # Denied access attempts
-            denied_sql = f"""
-                SELECT COUNT(*) FROM security_events
-                {time_clause_events}
-                {'AND' if time_clause_events else 'WHERE'}
-                (risk_level IN ('YELLOW', 'ORANGE', 'RED') AND event_type NOT LIKE '%CAMERA%' AND event_type NOT LIKE '%VOICE%')
-            """
-            cursor.execute(denied_sql, params_events)
-            denied_access_attempts = cursor.fetchone()[0]
+                # Authorized people seen
+                auth_sql = f"""
+                    SELECT COUNT(DISTINCT person_name)
+                    FROM security_events
+                    {time_clause_events}
+                    {'AND' if time_clause_events else 'WHERE'}
+                    (risk_level = 'GREEN' AND person_name IS NOT NULL AND person_name != '' AND person_name != 'Unknown')
+                """
+                cursor.execute(auth_sql, params_events)
+                authorized_people_seen = cursor.fetchone()[0]
 
-            return {
-                "active_incidents": active_incidents,
-                "resolved_incidents": resolved_incidents,
-                "spoof_attempts": spoof_attempts,
-                "after_hours_violations": after_hours_violations,
-                "restricted_zone_entries": restricted_zone_entries,
-                "unknown_visitors": unknown_visitors,
-                "distinct_people_seen": distinct_people_seen,
-                "authorized_people_seen": authorized_people_seen,
-                "denied_access_attempts": denied_access_attempts,
-            }
+                # Denied access attempts
+                denied_sql = f"""
+                    SELECT COUNT(*) FROM security_events
+                    {time_clause_events}
+                    {'AND' if time_clause_events else 'WHERE'}
+                    (risk_level IN ('YELLOW', 'ORANGE', 'RED') AND event_type NOT LIKE '%CAMERA%' AND event_type NOT LIKE '%VOICE%')
+                """
+                cursor.execute(denied_sql, params_events)
+                denied_access_attempts = cursor.fetchone()[0]
+
+                return {
+                    "active_incidents": active_incidents,
+                    "resolved_incidents": resolved_incidents,
+                    "spoof_attempts": spoof_attempts,
+                    "after_hours_violations": after_hours_violations,
+                    "restricted_zone_entries": restricted_zone_entries,
+                    "unknown_visitors": unknown_visitors,
+                    "distinct_people_seen": distinct_people_seen,
+                    "authorized_people_seen": authorized_people_seen,
+                    "denied_access_attempts": denied_access_attempts,
+                }
 
     def get_prioritized_active_incidents(self, limit: int = 10) -> List[Dict[str, Any]]:
         """
         Retrieves active security incidents prioritized by severity:
         CRITICAL/RED > RED > ORANGE > YELLOW > GREEN, then by updated_at DESC.
         """
-        with self._connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT * FROM security_incidents
-                WHERE state != 'RESOLVED'
-                ORDER BY 
-                    CASE risk_level 
-                        WHEN 'CRITICAL' THEN 1 
-                        WHEN 'RED' THEN 2 
-                        WHEN 'ORANGE' THEN 3 
-                        WHEN 'YELLOW' THEN 4 
-                        ELSE 5 
-                    END ASC,
-                    updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT * FROM security_incidents
+                    WHERE state != 'RESOLVED'
+                    ORDER BY 
+                        CASE risk_level 
+                            WHEN 'CRITICAL' THEN 1 
+                            WHEN 'RED' THEN 2 
+                            WHEN 'ORANGE' THEN 3 
+                            WHEN 'YELLOW' THEN 4 
+                            ELSE 5 
+                        END ASC,
+                        updated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
 
     def get_events_by_window(
         self,
@@ -835,31 +893,121 @@ class DatabaseManager:
         else:
             cutoff_iso = None
 
-        with self._connection() as conn:
-            cursor = conn.cursor()
-            if cutoff_iso:
-                cursor.execute(
-                    """
-                    SELECT * FROM security_events
-                    WHERE timestamp >= ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    (cutoff_iso, limit),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT * FROM security_events
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                if cutoff_iso:
+                    cursor.execute(
+                        """
+                        SELECT * FROM security_events
+                        WHERE timestamp >= ?
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                        """,
+                        (cutoff_iso, limit),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT * FROM security_events
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
 
-    # --- Database Maintenance & Clean Reset (Phase 2.7) ---
+    # --- Database Maintenance & Clean Reset (Phase 2.7 & 5.9) ---
+
+    def vacuum_database(self) -> bool:
+        """
+        Explicit maintenance operation: reclaims unused disk space.
+        Should only be run on operator request or maintenance scripts, never continuously.
+        """
+        with self._lock:
+            with self._connection() as conn:
+                conn.execute("VACUUM")
+                return True
+
+    def optimize_database(self) -> Dict[str, Any]:
+        """
+        Explicit maintenance operation: optimizes SQLite query planner and analyzes tables.
+        """
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA optimize")
+                cursor.execute("PRAGMA integrity_check(1)")
+                integrity = cursor.fetchone()[0]
+
+                table_counts: Dict[str, int] = {}
+                for tbl in [
+                    "users",
+                    "face_registrations",
+                    "detected_objects",
+                    "security_events",
+                    "ocr_documents",
+                    "system_logs",
+                    "security_incidents",
+                ]:
+                    cursor.execute(f"SELECT COUNT(*) FROM {tbl}")
+                    table_counts[tbl] = cursor.fetchone()[0]
+
+                return {
+                    "status": "OPTIMIZE_COMPLETE",
+                    "integrity": integrity,
+                    "table_counts": table_counts,
+                }
+
+    def clear_event_history(self, clear_incidents: bool = True) -> Dict[str, int]:
+        """
+        Clears stored security events and related runtime history records from SQLite.
+        Strictly preserves users, face registrations, database schema, and indexes.
+        
+        Args:
+            clear_incidents: If True, clears security_incidents before security_events
+                             to avoid foreign key constraint violations or orphaned incident records.
+        Returns:
+            Dictionary mapping table name to number of deleted records.
+        """
+        tables_to_clear = ["security_events", "detected_objects", "system_logs"]
+        if clear_incidents:
+            # Delete incidents first due to foreign key referencing security_events
+            tables_to_clear.insert(0, "security_incidents")
+
+        deleted_counts: Dict[str, int] = {}
+        with self._lock:
+            with self._connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("BEGIN TRANSACTION;")
+                    for tbl in tables_to_clear:
+                        cursor.execute(f"SELECT COUNT(*) FROM {tbl}")
+                        cnt = cursor.fetchone()[0]
+                        deleted_counts[tbl] = cnt
+                        cursor.execute(f"DELETE FROM {tbl}")
+
+                    # Reset SQLite auto-increment sequence for cleared history tables
+                    placeholders = ",".join("?" for _ in tables_to_clear)
+                    cursor.execute(
+                        f"DELETE FROM sqlite_sequence WHERE name IN ({placeholders})",
+                        tables_to_clear,
+                    )
+
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.error(f"[DATABASE] Transaction failed during clear_event_history: {e}")
+                    raise e
+
+                # Reclaim fragmented disk space
+                cursor.execute("VACUUM")
+
+                self._event_insert_counter = 0
+
+        logger.info(f"[DATABASE] Event history cleared successfully: {deleted_counts}")
+        return deleted_counts
 
     def reset_development_data(self, backup: bool = True, confirm: bool = False) -> Dict[str, Any]:
         """

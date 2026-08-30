@@ -18,7 +18,7 @@ from datetime import datetime
 from enum import Enum
 import json
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 import uuid
 import logging
 
@@ -73,6 +73,7 @@ class IncidentManager:
         self.db = db_manager
         self.cooldown_seconds = incident_cooldown_seconds
         self._active_incidents: Dict[str, SecurityIncident] = {}
+        self._resolved_incident_ids: Set[str] = set()
         self._latest_incident: Optional[SecurityIncident] = None
         self._last_incident_time_per_sig: Dict[str, float] = {}
         self._incident_seq = 1
@@ -131,18 +132,23 @@ class IncidentManager:
                     inc.reason = reason
                     return inc
 
-        # Debounce duplicate signatures within cooldown window
+        # Deduplicate active (unresolved) incident matching signature across active pool
+        if not force_new:
+            for inc in self._active_incidents.values():
+                if inc.state != IncidentState.RESOLVED and inc.policy_code == policy_code:
+                    same_person = (
+                        (inc.person_name == person_name)
+                        or (not inc.person_name and not person_name)
+                        or (person_name in ("Unknown", "Unregistered", None) and inc.person_name in ("Unknown", "Unregistered", None))
+                    )
+                    if same_person:
+                        inc.updated_at = now_iso
+                        inc.evidence_package["duration_seconds"] = round(duration_seconds, 1)
+                        inc.reason = reason
+                        return inc
+
         sig = f"{policy_code}_{person_name or 'Unregistered'}_{zone_name}"
         now_ts = time.time()
-        last_ts = self._last_incident_time_per_sig.get(sig, 0.0)
-
-        if not force_new and (now_ts - last_ts < self.cooldown_seconds):
-            for inc in self._active_incidents.values():
-                if inc.policy_code == policy_code and inc.state != IncidentState.RESOLVED:
-                    inc.updated_at = now_iso
-                    inc.evidence_package["duration_seconds"] = round(duration_seconds, 1)
-                    return inc
-
         self._last_incident_time_per_sig[sig] = now_ts
 
         # 1. Build Evidence Package
@@ -259,6 +265,10 @@ class IncidentManager:
         operator: str = "Operator",
     ) -> bool:
         """Transitions incident to RESOLVED state and removes from active tracking."""
+        if incident_id in self._resolved_incident_ids:
+            # Already resolved; strict no-op
+            return True
+
         incident = self._active_incidents.get(incident_id)
         if not incident and self.db:
             row = self.db.get_incident_by_id(incident_id)
@@ -269,6 +279,11 @@ class IncidentManager:
             logger.warning(f"Resolve failed: Incident '{incident_id}' not found.")
             return False
 
+        if incident.state == IncidentState.RESOLVED:
+            # Already resolved; record in tracking set and avoid duplicate logging/DB updates
+            self._resolved_incident_ids.add(incident_id)
+            return True
+
         now_iso = datetime.now().isoformat()
         incident.state = IncidentState.RESOLVED
         incident.resolved_at = now_iso
@@ -277,6 +292,7 @@ class IncidentManager:
 
         if incident_id in self._active_incidents:
             del self._active_incidents[incident_id]
+        self._resolved_incident_ids.add(incident_id)
 
         if self.db:
             try:
@@ -338,3 +354,12 @@ class IncidentManager:
             evidence_package=pkg,
             id=row.get("id"),
         )
+
+    def clear_active_incidents(self) -> None:
+        """Clears in-memory active incidents and resets incident sequence counter."""
+        self._active_incidents.clear()
+        self._resolved_incident_ids.clear()
+        self._latest_incident = None
+        self._last_incident_time_per_sig.clear()
+        self._incident_seq = 1
+        logger.info("[INCIDENT] In-memory active incidents cleared and sequence reset.")

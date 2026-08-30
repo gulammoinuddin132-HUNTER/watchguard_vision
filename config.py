@@ -47,11 +47,23 @@ PAD_BLINK_EAR_THRESHOLD = 0.22                  # Eye Aspect Ratio threshold for
 PAD_VERIFICATION_TIMEOUT_SECONDS = 5.0          # Max verification window before timing out to UNVERIFIED / ACCESS DENIED
 PAD_DEFAULT_MODEL = "Blink-EAR"                 # Default active PAD model ("Blink-EAR", "LBP-SVM", "MobileNetV3-Small", "EfficientNet-B0")
 
-# Object Detection Models & Thresholds (Phase 2.2)
+# Object Detection Models & Thresholds (Phase 2.2 & 5.19D)
 YOLOV8N_MODEL_PATH = MODELS_DIR / "yolov8n.onnx"
 OBJECT_DETECTION_CONFIDENCE_THRESHOLD = 0.45
 OBJECT_DETECTION_NMS_THRESHOLD = 0.45
 OBJECT_ALERT_COOLDOWN_SECONDS = 15.0
+
+# Phase 5.19D & 5.21 Unified WatchGuard Object Detection Configuration
+OBJECT_DETECTOR_MODE = os.getenv("OBJECT_DETECTOR_MODE", "production")  # "production" | "watchguard_custom" | "watchguard_unified"
+WATCHGUARD_CUSTOM_MODEL_PATH = MODELS_DIR / "yolo_watchguard_assets_v3.onnx"
+WATCHGUARD_CUSTOM_CONF_THRESHOLD = float(os.getenv("WATCHGUARD_CUSTOM_CONF_THRESHOLD", "0.35"))
+WATCHGUARD_CUSTOM_NMS_THRESHOLD = float(os.getenv("WATCHGUARD_CUSTOM_NMS_THRESHOLD", "0.45"))
+WATCHGUARD_CUSTOM_CLASSES = ["person", "laptop", "cell_phone", "mouse"]
+
+# Phase 5.21 84-Class Unified Model Settings
+WATCHGUARD_UNIFIED_MODEL_PATH = MODELS_DIR / "yolo_watchguard_unified_84.onnx"
+WATCHGUARD_UNIFIED_CONF_THRESHOLD = float(os.getenv("WATCHGUARD_UNIFIED_CONF_THRESHOLD", "0.35"))
+WATCHGUARD_UNIFIED_NMS_THRESHOLD = float(os.getenv("WATCHGUARD_UNIFIED_NMS_THRESHOLD", "0.45"))
 
 # COCO 80 Class Labels for YOLOv8
 COCO_CLASSES = [
@@ -67,8 +79,29 @@ COCO_CLASSES = [
     "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
 ]
 
+# Phase 5.21 Authoritative 84-Class Unified Taxonomy (80 COCO + 4 WatchGuard Security Assets)
+WATCHGUARD_UNIFIED_CLASSES = COCO_CLASSES + [
+    "pen",           # 80
+    "access_badge",  # 81
+    "usb_drive",     # 82
+    "keys",          # 83
+]
+
+# Security Asset Role & Classification Mapping (Phase 5.19D & 5.21)
+SECURITY_OBJECT_CATEGORIES: Dict[str, str] = {
+    "laptop": "protected",
+    "cell_phone": "security-relevant",
+    "cell phone": "security-relevant",
+    "mouse": "context-relevant",
+    "person": "entity",
+    "pen": "context-relevant",
+    "access_badge": "credential",
+    "usb_drive": "high-risk-asset",
+    "keys": "physical-access",
+}
+
 # Context & Security Intelligence Configuration (Phase 2.3)
-PROTECTED_OBJECT_CLASSES: List[str] = ["laptop", "cell phone", "backpack", "book"]
+PROTECTED_OBJECT_CLASSES: List[str] = ["laptop", "cell phone", "cell_phone", "backpack", "book"]
 
 # Virtual Surveillance Zones (Normalized bounding boxes [x, y, w, h] from 0.0 to 1.0)
 DEFAULT_ZONES: Dict[str, Dict[str, Any]] = {
@@ -97,6 +130,23 @@ AUTHORIZED_HOURS_END = "18:00"
 PROXIMITY_PIXEL_THRESHOLD = 150
 CONTEXT_ALERT_COOLDOWN_SECONDS = 15.0
 
+# Phase 5.20 Novelty Feature Research Configuration
+# 1. Tailgating & Multi-Person Access Anomaly
+TAILGATING_TIME_WINDOW_SECONDS = float(os.getenv("TAILGATING_TIME_WINDOW_SECONDS", "3.0"))
+TAILGATING_SPATIAL_THRESHOLD_PIXELS = float(os.getenv("TAILGATING_SPATIAL_THRESHOLD_PIXELS", "160.0"))
+TAILGATING_CONFIRMATION_FRAMES = int(os.getenv("TAILGATING_CONFIRMATION_FRAMES", "2"))
+TAILGATING_ALERT_COOLDOWN_SECONDS = float(os.getenv("TAILGATING_ALERT_COOLDOWN_SECONDS", "10.0"))
+
+# 2. Behavioral & Temporal Anomaly Engine
+BEHAVIOR_DWELL_THRESHOLD_SECONDS = float(os.getenv("BEHAVIOR_DWELL_THRESHOLD_SECONDS", "15.0"))
+BEHAVIOR_APPROACH_REPETITION_THRESHOLD = int(os.getenv("BEHAVIOR_APPROACH_REPETITION_THRESHOLD", "3"))
+BEHAVIOR_RESTRICTED_RETRY_THRESHOLD = int(os.getenv("BEHAVIOR_RESTRICTED_RETRY_THRESHOLD", "2"))
+
+# 3. Uncertainty-Aware Decision Layer
+CONFIDENCE_HIGH_THRESHOLD = float(os.getenv("CONFIDENCE_HIGH_THRESHOLD", "0.75"))
+CONFIDENCE_LOW_THRESHOLD = float(os.getenv("CONFIDENCE_LOW_THRESHOLD", "0.45"))
+CCSDF_WEIGHT_BEHAVIOR = float(os.getenv("CCSDF_WEIGHT_BEHAVIOR", "0.10"))
+
 # Database Configuration
 DATABASE_PATH = DATA_DIR / "watchguard.db"
 
@@ -112,6 +162,10 @@ LOG_FILE_PATH = LOGS_DIR / "watchguard.log"
 CONSOLE_LOG_LEVEL = os.getenv("CONSOLE_LOG_LEVEL", "INFO")
 FILE_LOG_LEVEL = os.getenv("FILE_LOG_LEVEL", "INFO")
 MAX_RECENT_EVENTS_DISPLAY = 100
+MAX_DATABASE_NORMAL_EVENTS = int(os.getenv("MAX_DATABASE_NORMAL_EVENTS", "500"))
+EVENT_RETENTION_CHECK_INTERVAL = int(os.getenv("EVENT_RETENTION_CHECK_INTERVAL", "25"))
+LOG_ROTATION_MAX_BYTES = int(os.getenv("LOG_ROTATION_MAX_BYTES", str(5 * 1024 * 1024)))
+LOG_ROTATION_BACKUP_COUNT = int(os.getenv("LOG_ROTATION_BACKUP_COUNT", "3"))
 
 # Risk Thresholds
 RISK_LEVELS = {

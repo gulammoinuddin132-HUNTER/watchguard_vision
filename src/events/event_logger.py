@@ -8,9 +8,17 @@ real-time subscriber callbacks (for UI dashboard updates).
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, List, Optional, Dict, Any
+from logging.handlers import RotatingFileHandler
 
-from config import LOG_FILE_PATH, CONSOLE_LOG_LEVEL, FILE_LOG_LEVEL
+from config import (
+    LOG_FILE_PATH,
+    CONSOLE_LOG_LEVEL,
+    FILE_LOG_LEVEL,
+    LOG_ROTATION_MAX_BYTES,
+    LOG_ROTATION_BACKUP_COUNT,
+)
 from src.database.db_manager import DatabaseManager
 from src.events.event_types import EventType, RiskLevel
 
@@ -31,15 +39,20 @@ class EventLogger:
             self._setup_file_logging()
 
     def _setup_file_logging(self) -> None:
-        """Sets up Python logging to file and stdout."""
+        """Sets up Python logging to rotating file and stdout."""
         self.logger = logging.getLogger("WatchGuardVision")
         self.logger.setLevel(logging.DEBUG)
 
         if not self.logger.handlers:
-            # File Handler
+            # Rotating File Handler
             if self.log_file_path:
                 file_level = getattr(logging, str(FILE_LOG_LEVEL).upper(), logging.INFO)
-                file_handler = logging.FileHandler(str(self.log_file_path), encoding="utf-8")
+                file_handler = RotatingFileHandler(
+                    str(self.log_file_path),
+                    maxBytes=LOG_ROTATION_MAX_BYTES,
+                    backupCount=LOG_ROTATION_BACKUP_COUNT,
+                    encoding="utf-8",
+                )
                 file_handler.setLevel(file_level)
                 file_formatter = logging.Formatter(
                     "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"

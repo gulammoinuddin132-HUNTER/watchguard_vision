@@ -68,12 +68,14 @@ class TestPhase572GUIArchitecture(unittest.TestCase):
         self.root.update()
 
     def tearDown(self):
+        if hasattr(self, "app") and self.app:
+            try:
+                self.app.close(destroy_root=False)
+            except Exception:
+                pass
         try:
-            self.app._on_close()
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
+            if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                self.root.destroy()
         except Exception:
             pass
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -112,12 +114,12 @@ class TestPhase572GUIArchitecture(unittest.TestCase):
 
     # --- Test 3: Event Table Guaranteed Minimum Height & Rows ---
     def test_03_event_table_guaranteed_height_and_rows(self):
-        """Event Table must have a physical height >= 200px and display all records."""
+        """Event Table must have a physical height >= 70px (compact ~3 rows) and display all records."""
         tree = self.app.tree
         th = tree.winfo_height()
         rows = len(tree.get_children())
 
-        self.assertGreaterEqual(th, 200, f"Treeview height ({th}px) must be >= 200px")
+        self.assertGreaterEqual(th, 70, f"Treeview height ({th}px) must be >= 70px")
         self.assertEqual(rows, 15, f"Treeview must contain all 15 records, found {rows}")
 
     # --- Test 4: Decoupled Vision State Architecture ---

@@ -44,17 +44,17 @@ class CardFrame(tk.Frame):
         )
         self.title = title
         if title:
-            header_frame = tk.Frame(self, bg=CARD_HEADER_BG, height=24)
-            header_frame.pack(fill="x", side="top")
-            header_frame.pack_propagate(False)
+            self.header_frame = tk.Frame(self, bg=CARD_HEADER_BG, height=24)
+            self.header_frame.pack(fill="x", side="top")
+            self.header_frame.pack_propagate(False)
 
             # Left accent dot
-            dot = tk.Label(header_frame, text="●", font=(FONT_SMALL[0], 7),
+            dot = tk.Label(self.header_frame, text="●", font=(FONT_SMALL[0], 7),
                            bg=CARD_HEADER_BG, fg=ACCENT_BLUE)
             dot.pack(side="left", padx=(6, 3), pady=2)
 
             lbl = tk.Label(
-                header_frame,
+                self.header_frame,
                 text=title.upper(),
                 font=FONT_SMALL,
                 bg=CARD_HEADER_BG,
@@ -74,12 +74,14 @@ class RiskBanner(tk.Frame):
         self.container = tk.Frame(
             self,
             bg=COLOR_GREEN,
-            padx=8,
-            pady=4,
+            padx=6,
+            pady=2,
+            height=46,
             highlightbackground=CARD_BORDER,
             highlightthickness=1,
         )
         self.container.pack(fill="x", expand=True)
+        self.container.pack_propagate(False)
 
         self.icon_label = tk.Label(
             self.container,
@@ -88,7 +90,7 @@ class RiskBanner(tk.Frame):
             bg=COLOR_GREEN,
             fg="#FFFFFF",
         )
-        self.icon_label.pack(side="left", padx=(0, 6))
+        self.icon_label.pack(side="left", padx=(0, 4))
 
         self.text_frame = tk.Frame(self.container, bg=COLOR_GREEN)
         self.text_frame.pack(side="left", fill="both", expand=True)
@@ -122,11 +124,11 @@ class RiskBanner(tk.Frame):
             except ValueError:
                 level = RiskLevel.GREEN
 
-        # Truncate description to single line with ellipsis if needed
+        # Truncate description to single line with ellipsis if needed (max 60 chars for 390px width)
         if description:
             clean_desc = description.strip()
-            if len(clean_desc) > 65:
-                desc_text = clean_desc[:62] + "..."
+            if len(clean_desc) > 60:
+                desc_text = clean_desc[:57] + "..."
             else:
                 desc_text = clean_desc
         else:

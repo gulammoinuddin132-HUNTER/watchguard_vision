@@ -1,0 +1,2 @@
+Image ID,GT Label,"GT BBox (x,y,w,h)",GT Area (px^2),Distance Tier,Predicted Label,Confidence,"Pred BBox (x,y,w,h)",IoU,Is True Positive,Latency (ms)
+test_live_webcam_04,NO_MATCH,None,0,N/A,person,0.911,"(38, 121, 581, 357)",0.0,False,68.55

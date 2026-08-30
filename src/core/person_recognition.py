@@ -359,7 +359,7 @@ class PersonRecognitionEngine(BaseVisionEngine):
             curr_state = joint_decision.status.value
             if prev_state != curr_state:
                 transition_str = f"{prev_state} -> {curr_state}" if prev_state != "NONE" else f"INITIAL_OBSERVATION -> {curr_state}"
-                logger.info(
+                logger.debug(
                     f"[STATE_TRANSITION Track #{track_id}] Identity='{name}' (Sim={match_pct}%): {transition_str} | "
                     f"Access={joint_decision.status.display_label} (Risk={joint_decision.risk_level.value})"
                 )

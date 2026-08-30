@@ -55,6 +55,11 @@ class SecurityDecision:
     incident: Optional[SecurityIncident] = None
     per_track_states: List[Dict[str, Any]] = field(default_factory=list)
     person_entities: List[Dict[str, Any]] = field(default_factory=list)
+    ccsdf_result: Optional[Dict[str, Any]] = None
+
+    @property
+    def access_state(self) -> str:
+        return "GRANTED" if self.is_access_granted else "DENIED"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +70,7 @@ class SecurityDecision:
             "evidence_required": self.evidence_required,
             "recommended_response": self.recommended_response,
             "is_access_granted": self.is_access_granted,
+            "access_state": self.access_state,
             "correlated_interactions": self.correlated_interactions,
             "context_summary": self.context_summary,
             "event_type": self.event_type.value,
@@ -72,6 +78,7 @@ class SecurityDecision:
             "incident": self.incident.to_dict() if self.incident else None,
             "per_track_states": self.per_track_states,
             "person_entities": self.person_entities,
+            "ccsdf_result": self.ccsdf_result,
         }
 
 
@@ -143,6 +150,21 @@ class ContextEngine:
         self._last_decision: Optional[SecurityDecision] = None
         self._simulated_time_override: Optional[dtime] = None
         self._active_zone_override: Optional[str] = None
+        self.scene_generation: int = 0
+        self._last_scene_signature: Optional[Tuple[Any, ...]] = None
+
+        # Phase 5.16 & 5.20: CCSDF, Tailgating, and Behavioral Anomaly Research Engines
+        try:
+            from src.research.ccsdf_engine import CCSDFEngine
+            from src.research.tailgating_engine import TailgatingDetector
+            from src.research.behavior_engine import BehaviorAnomalyEngine
+            self.ccsdf_engine: Optional[CCSDFEngine] = CCSDFEngine()
+            self.tailgating_detector: Optional[TailgatingDetector] = TailgatingDetector()
+            self.behavior_engine: Optional[BehaviorAnomalyEngine] = BehaviorAnomalyEngine()
+        except ImportError:
+            self.ccsdf_engine = None
+            self.tailgating_detector = None
+            self.behavior_engine = None
 
     @property
     def last_decision(self) -> Optional[SecurityDecision]:
@@ -308,6 +330,9 @@ class ContextEngine:
         is_primary_known = bool(primary_person.get("is_known", False)) if primary_person else False
         is_primary_spoof = bool(primary_person.get("is_spoof", False)) if primary_person else False
 
+        primary_track_id = primary_person.get("track_id", 1) if primary_person else None
+        primary_track_state = self.track_manager.get_track(primary_track_id) if primary_track_id else None
+
         context_summary = {
             "person_detected": has_person or len(entities) > 0,
             "person_name": person_name or "None",
@@ -415,7 +440,15 @@ class ContextEngine:
                     pol_res.policy_code = esc_code
                     pol_res.reason = esc_reason
                     pol_res.explainable_tuple.result = f"ACCESS DENIED (ESCALATED) | Risk: {esc_risk.value} | Decision: {esc_code}"
-                    pol_res.explainable_tuple.why = esc_reason
+                # Synchronize fused PersonEntity with post-policy evaluated track state
+                for ent in entities:
+                    if ent.track_id == tid:
+                        ent.access_state = t_state.access_state
+                        ent.decision_code = pol_res.policy_code
+                        ent.reason = pol_res.reason
+                        ent.risk_level = pol_res.risk_level
+                        ent.zone = p_zone
+                        ent.zone_name = p_zone_name
 
                 track_states_list.append(t_state.to_dict())
                 track_eval_results.append(pol_res)
@@ -424,6 +457,9 @@ class ContextEngine:
         if track_eval_results:
             risk_rank = {RiskLevel.RED: 3, RiskLevel.ORANGE: 2, RiskLevel.YELLOW: 1, RiskLevel.GREEN: 0}
             top_eval = max(track_eval_results, key=lambda r: risk_rank.get(r.risk_level, 0))
+
+            # Synchronize context_summary with post-policy authoritative entities
+            context_summary["person_entities"] = [e.to_dict() for e in entities]
 
             decision = SecurityDecision(
                 risk_level=top_eval.risk_level,
@@ -502,6 +538,98 @@ class ContextEngine:
                     primary_track_state.active_spoof_incident_id = incident.incident_id
                 else:
                     primary_track_state.active_zone_incident_id = incident.incident_id
+
+        # Scene signature & generation tracking for live state consistency (Phase 5.11)
+        scene_sig = (
+            len(entities),
+            tuple(sorted(getattr(e, "identity", "Unknown") for e in entities)),
+            tuple(sorted(getattr(e, "access_state", "UNKNOWN") for e in entities)),
+            len(non_person_objects),
+            tuple(sorted(o.get("label", "") for o in non_person_objects)),
+            zone,
+            decision.risk_level.value,
+        )
+        if scene_sig != self._last_scene_signature:
+            self.scene_generation += 1
+            self._last_scene_signature = scene_sig
+
+        # Phase 5.20: Tailgating & Behavioral Anomaly Evaluation
+        s_beh = 0.0
+        beh_status = "NORMAL_ACTIVITY"
+        is_tailgating = False
+        s_tail = 0.0
+        tail_status = "NONE"
+        tail_conf = 0.0
+        foll_ident = None
+        auth_ident = None
+        tail_dist = 999.0
+
+        if getattr(self, "tailgating_detector", None) is not None and len(entities) >= 2:
+            entities_dicts = [
+                {
+                    "track_id": getattr(e, "track_id", idx + 1),
+                    "identity": getattr(e, "name", getattr(e, "identity", "Unknown Person")),
+                    "is_known": getattr(e, "is_known", False),
+                    "access_state": getattr(e, "access_state", "PENDING"),
+                    "liveness_state": getattr(e, "liveness_state", "LIVE"),
+                    "bbox": getattr(e, "bbox", (0, 0, 0, 0)),
+                    "zone": zone,
+                }
+                for idx, e in enumerate(entities)
+            ]
+            tail_events, s_tail = self.tailgating_detector.evaluate_tracks(entities_dicts)
+            if tail_events:
+                is_tailgating = True
+                tail_status = "TAILGATING_SUSPECTED"
+                first_tail = tail_events[0]
+                tail_conf = first_tail.confidence
+                foll_ident = first_tail.follower_identity
+                auth_ident = first_tail.authorized_identity
+                tail_dist = first_tail.spatial_distance
+
+        if getattr(self, "behavior_engine", None) is not None and primary_person:
+            tid = primary_person.get("track_id", 1)
+            p_ident = primary_person.get("name", "Unknown Person")
+            p_known = primary_person.get("is_known", False)
+            nearest_dist = 999.0
+            if protected_interactions:
+                nearest_dist = float(protected_interactions[0].get("distance_pixels", 50.0))
+            is_viol = ("DENIED" in decision.access_state or decision.risk_level.value in ("RED", "ORANGE"))
+            s_beh, beh_status, _ = self.behavior_engine.update_track_observation(
+                track_id=tid,
+                identity=p_ident,
+                is_known=p_known,
+                zone=zone,
+                is_after_hours=not is_auth_time,
+                nearest_asset_dist=nearest_dist,
+                is_violation=is_viol,
+            )
+
+        context_summary["s_behavior"] = s_beh
+        context_summary["behavior_status"] = beh_status
+        context_summary["is_tailgating_suspected"] = is_tailgating
+        context_summary["s_tailgating"] = s_tail
+        context_summary["tailgating_status"] = tail_status
+        context_summary["tailgating_confidence"] = tail_conf
+        context_summary["follower_identity"] = foll_ident
+        context_summary["authorized_identity"] = auth_ident
+        context_summary["tailgating_distance"] = tail_dist
+
+        # Phase 5.16 & 5.20: Non-intrusive CCSDF Research Evaluation Layer
+        if getattr(self, "ccsdf_engine", None) is not None:
+            try:
+                ccsdf_eval = self.ccsdf_engine.evaluate_decision_context(
+                    decision=decision,
+                    primary_person=primary_person,
+                    primary_track_state=primary_track_state,
+                    context_summary=context_summary,
+                    protected_interactions=protected_interactions,
+                    is_auth_time=is_auth_time,
+                    time_str=time_str,
+                )
+                decision.ccsdf_result = ccsdf_eval.to_dict()
+            except Exception as e:
+                logger.debug(f"CCSDF evaluation skipped: {e}")
 
         self._last_decision = decision
         return decision

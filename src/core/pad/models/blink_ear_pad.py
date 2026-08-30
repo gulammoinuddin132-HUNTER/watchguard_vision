@@ -597,7 +597,7 @@ class BlinkEARPADEngine(BasePADEngine):
                 track.blink_count += 1
                 track.blink_state = "OPEN"
                 track.closed_frame_count = 0
-                logger.info(f"[TRACK #{track.track_id}] Natural blink confirmed. Total verified blinks: {track.blink_count}")
+                logger.debug(f"[TRACK #{track.track_id}] Natural blink confirmed. Total verified blinks: {track.blink_count}")
             else:
                 track.closed_frame_count += 1
                 if track.closed_frame_count > 15:

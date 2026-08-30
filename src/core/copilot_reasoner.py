@@ -170,11 +170,17 @@ def build_structured_ai_context(
             e_conf = getattr(e, "identity_confidence", 0.0) if not isinstance(e, dict) else e.get("identity_confidence", 0.0)
             e_role = getattr(e, "role", "Visitor") if not isinstance(e, dict) else e.get("role", "Visitor")
             e_known = getattr(e, "is_known", False) if not isinstance(e, dict) else e.get("is_known", False)
+            if e_ident in ("Unknown Person", "Unknown", "Unregistered", "None", "", None) or master_decision_code in ("UNKNOWN_PERSON", "UNAUTHORIZED_RESTRICTED_ZONE_ACCESS"):
+                e_known = False
+
             e_liveness = getattr(e, "liveness_state", "WARMUP") if not isinstance(e, dict) else e.get("liveness_state", "WARMUP")
             e_live_conf = getattr(e, "liveness_confidence", 0.0) if not isinstance(e, dict) else e.get("liveness_confidence", 0.0)
             e_spoof = getattr(e, "is_spoof", False) if not isinstance(e, dict) else e.get("is_spoof", False)
             e_zone = getattr(e, "zone_name", current_zone) if not isinstance(e, dict) else e.get("zone_name", current_zone)
             e_access = getattr(e, "access_state", "PENDING") if not isinstance(e, dict) else e.get("access_state", "PENDING")
+            if not e_known or getattr(last_decision, "is_access_granted", True) is False:
+                e_access = "SPOOF_REJECTED" if e_spoof else "DENIED"
+
             e_risk = getattr(e, "risk_level", RiskLevel.GREEN) if not isinstance(e, dict) else e.get("risk_level", "GREEN")
             e_risk_str = e_risk.value if hasattr(e_risk, "value") else str(e_risk)
             e_reason = getattr(e, "reason", master_reason) if not isinstance(e, dict) else e.get("reason", master_reason)
@@ -221,11 +227,49 @@ def build_structured_ai_context(
                 "reason": inc.reason,
             })
 
+    # Extract Research / CCSDF / Novelty features
+    ccsdf_info = {}
+    tailgating_info = {}
+    behavior_info = {}
+    uncertainty_info = {}
+    if last_decision and hasattr(last_decision, "ccsdf_result") and last_decision.ccsdf_result:
+        res = last_decision.ccsdf_result
+        ccsdf_info = {
+            "risk_score": res.get("risk_score", 0.0),
+            "risk_level": res.get("risk_level", master_risk),
+            "dominant_factor": res.get("dominant_factor", "nominal"),
+            "recommended_action": res.get("recommended_action", "ALLOW"),
+            "normalized_signals": res.get("normalized_signals", {}),
+        }
+        tailgating_info = {
+            "status": res.get("tailgating_status", "NONE"),
+            "leader_track_id": res.get("tailgating_leader_track_id"),
+            "leader_identity": res.get("tailgating_leader", "Authorized Person"),
+            "follower_track_id": res.get("tailgating_follower_track_id"),
+            "follower_identity": res.get("tailgating_follower", "Unknown Person"),
+            "distance": res.get("tailgating_distance", 0.0),
+            "authorization_transfer": "NEVER (Leader auth never transfers to follower)",
+        }
+        behavior_info = {
+            "status": res.get("behavior_status", "NORMAL_ACTIVITY"),
+            "s_behavior": res.get("normalized_signals", {}).get("behavior", 0.0),
+        }
+        uncertainty_info = {
+            "confidence_tier": res.get("confidence_tier", "HIGH"),
+            "confidence": res.get("confidence", {}),
+        }
+
+    import os
+    from config import OBJECT_DETECTOR_MODE
+    active_det_mode = os.getenv("WATCHGUARD_DETECTOR_MODE", OBJECT_DETECTOR_MODE)
+
     current_state = {
         "timestamp": now_time_str,
         "active_zone": current_zone,
         "operating_hours_window": f"{h_start} to {h_end}",
         "time_status": "NORMAL_HOURS" if is_authorized_hours else "AFTER_HOURS",
+        "detector_mode": active_det_mode,
+        "detector_classes_count": 84 if active_det_mode == "watchguard_unified" else (4 if active_det_mode == "watchguard_custom" else 80),
         "master_risk_level": master_risk,
         "master_decision_code": master_decision_code,
         "master_reason": master_reason,
@@ -236,6 +280,10 @@ def build_structured_ai_context(
         "objects": live_objects,
         "live_detected_objects": live_objects,
         "active_incidents": active_incidents,
+        "ccsdf_state": ccsdf_info,
+        "tailgating_state": tailgating_info,
+        "behavior_state": behavior_info,
+        "uncertainty_state": uncertainty_info,
     }
 
     # --- 2. RECENT_HISTORY (Bounded 5-minute / 15-minute window) ---
@@ -277,7 +325,7 @@ def build_structured_ai_context(
             "distinct_people_seen_today": mtoday.distinct_people_seen,
             "authorized_people_seen_today": mtoday.authorized_people_seen,
             "unknown_visitors_today": mtoday.unknown_visitors,
-            "spoof_attempts_today": mtoday.spoof_attempts,
+            "confirmed_spoofs_today": mtoday.spoof_attempts,
             "after_hours_violations_today": mtoday.after_hours_violations,
             "total_incidents_today": mtoday.active_incidents + mtoday.resolved_incidents,
         }
@@ -305,39 +353,43 @@ def build_structured_ai_context(
     }
 
 
-COPILOT_SYSTEM_PROMPT = """You are the AI Security Copilot for WatchGuard Vision, an advanced computer vision physical access control and surveillance system.
+COPILOT_SYSTEM_PROMPT = """You are the AI Security Copilot for WatchGuard Vision, an advanced edge-based continuous contextual physical security and surveillance system.
 
-AUTHORITY CONSTRAINT:
-The deterministic WatchGuard Security Engine is the SOLE authority on identity, liveness (PAD), zone policies, risk posture (GREEN/YELLOW/ORANGE/RED), and access decisions (GRANTED/DENIED/PENDING).
+AUTHORITY & POLICY CONSTRAINT:
+The deterministic WatchGuard Security Engine and PolicyEngine are the SOLE authority on identity, liveness (PAD), zone policy, risk posture (GREEN/YELLOW/ORANGE/RED), and access decisions (GRANTED/DENIED/PENDING).
 You explain, summarize, and synthesize the authoritative state. You CANNOT override decisions, alter risk ratings, or grant access.
 
-ANTI-HALLUCINATION GUARDRAIL:
-Ground all responses strictly in the provided JSON context and provided visual snapshot. Never invent people, objects, security incidents, psychological intent, guilt, or events not present in the context.
+FULL ARCHITECTURE & DOMAIN KNOWLEDGE:
+1. OBJECT PERCEPTION MODES:
+   - "production": Standard YOLOv8n (80 COCO classes).
+   - "watchguard_unified": Unified 84-class detector (80 COCO + 80: pen, 81: access_badge, 82: usb_drive, 83: keys).
+   - "watchguard_custom": 4-class research prototype.
+2. DOMAIN SECURITY ASSETS:
+   - pen (context-relevant), access_badge (credential), usb_drive (high-risk asset), keys (physical access credential).
+   - Objects are visual evidence, NOT automatic attacks. A USB drive alone is never an automatic attack; its risk depends on who holds it, zone, time, proximity to protected workstations, behavior, and history.
+3. CONTINUOUS CONTEXTUAL SECURITY DECISION FUSION (CCSDF):
+   - Continuous vector S(t) = [Sid, Spad, Szone, Stime, Sprox, Shist, Sasset, Sbehavior].
+   - Computes continuous risk R(t) = Sum(w_i * S_i).
+4. TAILGATING RULES:
+   - Triggered when an authorized leader is closely followed by an unknown/unauthorized follower into a secure zone.
+   - CRITICAL: Leader authorization NEVER transfers to follower. Follower access remains DENIED.
+5. BEHAVIOR ANOMALY ENGINE:
+   - Tracks dwell time, repeated restricted zone attempts, and after-hours presence.
+   - S_behavior in [0, 1] categorized as NORMAL_ACTIVITY (<0.35), UNUSUAL_PATTERN (0.35-0.70), or BEHAVIOR_ANOMALY (>=0.70).
+6. UNCERTAINTY-AWARE GATING:
+   - Evaluated across biometric geometric mean and contextual telemetry into HIGH (>=0.75), MEDIUM (0.45-0.75), and LOW (<0.45) tiers.
+   - LOW confidence places candidate access into PENDING_VERIFICATION; never silently authorizes.
+7. SPOOFS TODAY COUNTER:
+   - Measures CONFIRMED PRESENTATION ATTACK SESSIONS recorded today (edge-triggered), NOT raw camera frames.
 
-MULTIMODAL & OBJECT HOLDING RULES:
-1. When an image snapshot is provided and the user asks what they or someone is holding, inspect the hands and physical grasp in the visual snapshot (e.g. mouse, bottle, phone, cup, pen, badge, book).
-2. If an object is visible in hand, state what it is concisely and directly.
-3. If no object is held in hand, clearly state: "You do not appear to be holding any object."
-4. Never invent weapons or items not visible in the frame or detected in the state.
+STRICT INVARIANTS:
+1. UNREGISTERED / UNKNOWN != AUTHORIZED. An unknown person is strictly ACCESS DENIED.
+2. CONFIRMED SPOOF / PAD FAILURE -> Immediate DENY (RED).
+3. POLICY DENY -> Immutable. CCSDF recommendations cannot override a PolicyEngine DENY.
+4. If data is unavailable, state: "I do not currently have evidence for that."
 
-CURRENT STATE VS REGISTERED PROFILES:
-1. CURRENT_STATE.people lists ONLY individuals currently visible in the camera frame.
-2. People in the database registry who are not in CURRENT_STATE.people are NOT in the room. Never claim an authorized person is present merely because an authorized profile exists in the database.
-3. Live PersonEntity records in the structured context are the authoritative ground truth for people count and identities.
-
-STRICT SEMANTIC & ACCESS INVARIANTS:
-1. UNREGISTERED != AUTHORIZED. An unregistered person or visitor is NEVER authorized. Never say "UNKNOWN PERSON is authorized as Unregistered Visitor" or similar.
-2. UNKNOWN_VISITOR != ACCESS_GRANTED. Unregistered visitors in Restricted Areas are strictly ACCESS DENIED.
-3. YELLOW != ACCESS_GRANTED. Attention risk is NOT access granted.
-4. LIVE != AUTHORIZED. A person verified live via PAD is NOT authorized unless they are also registered with security clearance.
-5. Risk level (GREEN/YELLOW/ORANGE/RED) and Access status (GRANTED/DENIED/PENDING) are independent fields.
-
-CONVERSATIONAL RULES:
-1. Provide concise, direct, professional spoken answers (1 to 3 sentences maximum).
-2. Clearly reference specific evidence: person names, liveness status, zone names, timestamps, and policy windows when explaining why a decision was reached.
-3. If an individual is denied due to after-hours policy, explicitly cite the operating window (e.g. 09:00 to 18:00).
-4. If a question cannot be answered from the provided state, plainly say so based only on available data.
-"""
+RESPONSE STRUCTURE FOR REASONING INQUIRIES:
+Prefer: CURRENT STATE -> relevant evidence -> contextual factors -> CCSDF risk -> recommendation -> authoritative decision."""
 
 
 class BaseAICopilotReasoner(ABC):
@@ -419,7 +471,9 @@ class DeterministicCopilotReasoner(BaseAICopilotReasoner):
                     is_in_restricted = "restricted" in active_zone.lower() or "restricted" in code.lower()
                     is_after_hours = curr.get("time_status") == "AFTER_HOURS" or "AFTER_HOURS" in code or "outside" in curr.get("master_reason", "").lower()
                     is_repeated = "REPEATED" in code or "repeated" in curr.get("master_reason", "").lower()
-                    if is_in_restricted:
+                    if "protected" in active_zone.lower() or "asset" in active_zone.lower() or "protected" in curr.get("master_reason", "").lower():
+                        text = "Access is denied. An unregistered individual was detected in the Protected Asset Area."
+                    elif is_in_restricted:
                         if is_after_hours and is_repeated:
                             text = "Access is denied. You are currently unregistered and inside the Restricted Area after permitted hours. WatchGuard has also detected repeated restricted-zone violations."
                         elif is_after_hours:
@@ -427,13 +481,17 @@ class DeterministicCopilotReasoner(BaseAICopilotReasoner):
                         elif is_repeated:
                             text = "Access is denied. You are currently unregistered and inside the high-security Restricted Area, where repeated unauthorized zone entries have occurred."
                         else:
-                            text = "Access is denied: You are not registered in the security database, and unregistered visitors are prohibited from the Restricted Area."
+                            text = "Access is denied. An unregistered individual was detected in the Restricted Area."
                     else:
                         text = "Access is denied: You are not registered in the facial database and do not have active security clearance."
                 elif "AFTER_HOURS" in code or ("restricted" in active_zone.lower() and curr.get("time_status") == "AFTER_HOURS") or "outside" in curr.get("master_reason", "").lower():
-                    text = f"Access was denied because {p_ident} was observed in the {active_zone} outside the permitted {h_win} operating window."
+                    target_disp = f"{p_ident} was observed in the {active_zone}" if (p_ident and p_ident not in ("The individual", "Unknown Person", "Unknown", None, "")) else "this was observed"
+                    text = f"Access is denied because {target_disp} outside the permitted {h_win} operating window."
                 else:
-                    text = f"Security status is {curr.get('master_risk_level', 'GREEN')} ({code}): {curr.get('master_reason', 'Routine operations')}."
+                    if curr.get("is_access_granted") is False or curr.get("master_risk_level") in ("YELLOW", "ORANGE", "RED"):
+                        text = f"Access is denied. The system classified the situation as {curr.get('master_risk_level', 'YELLOW')} because: {curr.get('master_reason', 'Policy restriction')}."
+                    else:
+                        text = f"Security status is {curr.get('master_risk_level', 'GREEN')} ({code}): {curr.get('master_reason', 'Routine operations')}."
 
         # Recent events / temporal summary
         elif "what happened" in q_lower or "last" in q_lower or "recent" in q_lower:

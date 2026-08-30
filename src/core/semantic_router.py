@@ -295,6 +295,102 @@ class SemanticQueryRouter:
                     is_fast_path=True,
                 )
 
+        # 6.5 Phase 5.16: Research & CCSDF Queries
+        if re.search(r"\b(what\s+would\s+(the\s+)?baseline|baseline\s+(face|system|decision)|how\s+would\s+(the\s+)?baseline)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_BASELINE_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        if re.search(r"\b(what\s+factors?\s+caused\s+(the\s+)?risk|which\s+(contextual\s+)?factor\s+is\s+contributing\s+most|factors?\s+caused\s+(the\s+)?risk\s+increase|contextual\s+factors?|which\s+factors?\s+caused\s+the\s+restriction)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_RISK_FACTORS", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        if re.search(r"\b(why\s+did\s+authorization\s+change|what\s+changed\s+when\s+(he|she|they|the\s+person)\s+entered|why\s+authorization\s+changed)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_AUTHORIZATION_CHANGE", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        # Phase 5.20 Novelty Feature Research Queries
+        if re.search(r"\b(was\s+tailgating\s+detected|is\s+someone\s+tailgating|tailgating\s+(status|detected|suspected))\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_TAILGATING_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        if re.search(r"\b(what\s+behavior\s+was\s+unusual|what\s+was\s+the\s+behavior\s+anomaly|behavior\s+(anomaly|pattern|status)|suspicious\s+behavior)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_BEHAVIOR_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        if re.search(r"\b(how\s+confident\s+is\s+the\s+(current\s+)?decision|what\s+is\s+the\s+decision\s+confidence|how\s+certain\s+are\s+you|confidence\s+level)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_CONFIDENCE_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        # Security Objects (pen, access_badge, usb_drive, keys)
+        if re.search(r"\b(what\s+security\s+objects|security\s+objects|(was|were)\s+(a\s+)?(usb|usb\s+drive|pen|badge|access\s+badge|key|keys)|who\s+is\s+associated\s+with\s+(the\s+)?(usb|badge|key|pen)|who\s+has\s+the\s+(usb|badge|key|pen))\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "SECURITY_OBJECTS_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        # Active Detector Mode Query
+        if re.search(r"\b(what\s+(object\s+)?detector(\s+mode|\s+is\s+active)?|which\s+detector|active\s+detector|which\s+model\s+is\s+running|what\s+model\s+is\s+active|is\s+unified\s+detector\s+active|detector\s+mode)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "DETECTOR_MODE_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        # Research Novelty / Concept Query
+        if re.search(r"\b(what\s+is\s+novel|novelty\s+of\s+watchguard|research\s+contribution|what\s+makes\s+watchguard\s+(different|unique|novel)|explain\s+the\s+research\s+architecture)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_NOVELTY_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
+        # CCSDF State / Risk Query
+        if re.search(r"\b(what\s+is\s+(the\s+)?(current\s+)?ccsdf\s+(risk|state|score)|current\s+ccsdf\s+risk|what\s+is\s+the\s+dominant\s+risk\s+factor)\b", resolved_text):
+            return SemanticResolution(
+                raw_query=raw_query,
+                normalized_query=resolved_text,
+                intent=getattr(self.VoiceIntent, "RESEARCH_CCSDF_STATE_QUERY", self.VoiceIntent.UNKNOWN),
+                confidence=0.98,
+                is_fast_path=True,
+            )
+
         # 7. Follow-Up Person Authorization Check ("Is Hunter allowed to be here?", "Are they authorized?")
         if not re.search(r"\b(hours|window|times|schedule)\b", resolved_text):
             auth_check_patterns = [

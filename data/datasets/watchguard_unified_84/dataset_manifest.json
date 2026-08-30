@@ -1,0 +1,42 @@
+{
+  "dataset_name": "WatchGuard Unified 84-Class Co-Training Dataset",
+  "version": "1.0-foundation",
+  "total_classes": 84,
+  "yolo_output_channels": 88,
+  "classes": {
+    "coco_80_range": [0, 79],
+    "watchguard_security_range": [80, 83],
+    "new_security_classes": [
+      {"id": 80, "name": "pen", "category": "context-relevant"},
+      {"id": 81, "name": "access_badge", "category": "credential"},
+      {"id": 82, "name": "usb_drive", "category": "high-risk-asset"},
+      {"id": 83, "name": "keys", "category": "physical-access"}
+    ]
+  },
+  "dataset_splits": {
+    "images_dir": "images",
+    "labels_dir": "labels",
+    "splits": ["train", "val", "test"]
+  },
+  "collection_specification": {
+    "target_coco_replay_images": 3000,
+    "target_security_domain_images": 2000,
+    "target_per_class_annotations": {
+      "pen": 600,
+      "access_badge": 600,
+      "usb_drive": 600,
+      "keys": 600
+    },
+    "distance_tier_breakdown": {
+      "close": 0.33,
+      "medium": 0.42,
+      "far": 0.25
+    }
+  },
+  "leakage_protection_rules": [
+    "Strict disjoint physical locations/scenes between train and test splits",
+    "Distinct physical hardware instances of security tokens across train and test",
+    "No adjacent video frames (<15s separation) across train/val/test splits",
+    "Image perceptual hash (pHash) uniqueness enforcement"
+  ]
+}

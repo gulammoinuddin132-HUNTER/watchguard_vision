@@ -1,0 +1,78 @@
+{
+  "metadata": {
+    "model_name": "Production_YOLOv8n_COCO",
+    "input_resolution": "640x640",
+    "total_frames_evaluated": 4,
+    "timestamp_iso": "2026-08-30T08:23:22Z"
+  },
+  "aggregate_metrics": {
+    "total_ground_truths": 9,
+    "true_positives": 1,
+    "false_positives": 0,
+    "false_negatives": 8,
+    "overall_precision": 1.0,
+    "overall_recall": 0.1111,
+    "overall_f1": 0.2,
+    "ar_small_far_recall": 0.0,
+    "medium_tier_recall": 0.0,
+    "close_tier_recall": 0.3333
+  },
+  "distance_tier_breakdown": {
+    "CLOSE": {
+      "gt": 3,
+      "tp": 1,
+      "fn": 2
+    },
+    "MEDIUM": {
+      "gt": 4,
+      "tp": 0,
+      "fn": 4
+    },
+    "FAR": {
+      "gt": 2,
+      "tp": 0,
+      "fn": 2
+    }
+  },
+  "class_level_metrics": {
+    "person": {
+      "ground_truth_count": 1,
+      "true_positives": 1,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "laptop": {
+      "ground_truth_count": 3,
+      "true_positives": 0,
+      "false_positives": 0,
+      "false_negatives": 3,
+      "precision": 0.0,
+      "recall": 0.0
+    },
+    "cell_phone": {
+      "ground_truth_count": 2,
+      "true_positives": 0,
+      "false_positives": 0,
+      "false_negatives": 2,
+      "precision": 0.0,
+      "recall": 0.0
+    },
+    "mouse": {
+      "ground_truth_count": 3,
+      "true_positives": 0,
+      "false_positives": 0,
+      "false_negatives": 3,
+      "precision": 0.0,
+      "recall": 0.0
+    }
+  },
+  "latency_metrics": {
+    "mean_ms": 81.79,
+    "p50_ms": 76.74,
+    "p95_ms": 99.4,
+    "p99_ms": 102.32,
+    "theoretical_fps": 12.2
+  }
+}

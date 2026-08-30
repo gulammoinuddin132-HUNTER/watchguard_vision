@@ -233,18 +233,37 @@ class PersonEntityFusionEngine:
             entities.append(unmatched_entity)
             unmatched_seq += 1
 
-        # 4. Associate Non-Person Objects (cell phone, laptop, etc.) with Entities
+        # 4. Associate Non-Person Objects (cell phone, laptop, usb, etc.) with Entities
         for obj in non_person_objects:
             obj_bbox = obj.get("bbox", (0, 0, 0, 0))
+            best_dist = float("inf")
+            best_entity: Optional[PersonEntity] = None
+
             for entity in entities:
                 dist = self._compute_box_distance(entity.bbox, obj_bbox)
-                if dist <= self.proximity_threshold:
-                    entity.associated_objects.append({
-                        "object_label": obj.get("label", "object"),
-                        "confidence": obj.get("confidence", 0.0),
-                        "distance_pixels": round(dist, 1),
-                        "bbox": obj_bbox,
-                    })
+                if dist <= self.proximity_threshold and dist < best_dist:
+                    best_dist = dist
+                    best_entity = entity
+
+            if best_entity is not None:
+                assoc_conf = max(0.0, 1.0 - (best_dist / max(self.proximity_threshold, 1.0)))
+                obj["associated_person_track"] = best_entity.track_id
+                obj["pixel_distance_to_person"] = round(best_dist, 1)
+                obj["association_confidence"] = round(assoc_conf, 3)
+
+                best_entity.associated_objects.append({
+                    "object_label": obj.get("label", "object"),
+                    "confidence": obj.get("confidence", 0.0),
+                    "distance_pixels": round(best_dist, 1),
+                    "association_confidence": round(assoc_conf, 3),
+                    "bbox": obj_bbox,
+                    "is_confirmed": obj.get("is_confirmed", True),
+                    "security_category": obj.get("security_category", "context-relevant"),
+                })
+            else:
+                obj["associated_person_track"] = None
+                obj["pixel_distance_to_person"] = -1.0
+                obj["association_confidence"] = 0.0
 
         # 5. Build Clean Semantic Object Summary (excluding absorbed person objects)
         if non_person_objects:

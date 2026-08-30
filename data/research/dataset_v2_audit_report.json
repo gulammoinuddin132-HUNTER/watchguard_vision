@@ -1,0 +1,54 @@
+{
+  "train": {
+    "image_count": 420,
+    "label_file_count": 420,
+    "missing_label_files": 0,
+    "missing_image_files": 0,
+    "empty_background_images": 0,
+    "class_distribution": {
+      "person": 141,
+      "laptop": 210,
+      "cell_phone": 105,
+      "mouse": 420
+    },
+    "mouse_distance_distribution": {
+      "CLOSE": 98,
+      "MEDIUM": 182,
+      "FAR": 140
+    }
+  },
+  "val": {
+    "image_count": 60,
+    "label_file_count": 60,
+    "missing_label_files": 0,
+    "missing_image_files": 0,
+    "empty_background_images": 0,
+    "class_distribution": {
+      "laptop": 30,
+      "cell_phone": 21,
+      "mouse": 60,
+      "person": 30
+    },
+    "mouse_distance_distribution": {
+      "CLOSE": 11,
+      "MEDIUM": 29,
+      "FAR": 20
+    }
+  },
+  "overall": {
+    "total_images": 480,
+    "total_annotations": 1017,
+    "class_totals": {
+      "person": 171,
+      "laptop": 240,
+      "cell_phone": 126,
+      "mouse": 480
+    },
+    "mouse_tier_totals": {
+      "CLOSE": 109,
+      "MEDIUM": 211,
+      "FAR": 160
+    },
+    "audit_passed": true
+  }
+}

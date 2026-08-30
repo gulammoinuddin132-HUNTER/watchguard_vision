@@ -166,7 +166,7 @@ class CameraManager:
             ("CAP_MSMF", cv2.CAP_MSMF),
         ]
 
-        logger.info(f"[CAMERA DIAGNOSTIC] Probing camera device indexes 0 to {max_indices - 1}...")
+        logger.debug(f"[CAMERA DIAGNOSTIC] Probing camera device indexes 0 to {max_indices - 1}...")
         for idx in range(max_indices):
             for b_name, b_flag in backends:
                 try:
@@ -188,7 +188,7 @@ class CameraManager:
                                 "fps": fps,
                             }
                             found_devices.append(dev_info)
-                            logger.info(
+                            logger.debug(
                                 f"[CAMERA DIAGNOSTIC] -> Index {idx} [{b_name}]: OPENED=True, Read=True, Resolution={w}x{h}, FPS={fps}"
                             )
                             cap.release()
@@ -197,16 +197,16 @@ class CameraManager:
                 except Exception as e:
                     logger.debug(f"[CAMERA DIAGNOSTIC] Probe index {idx} ({b_name}) error: {e}")
 
-        logger.info(f"[CAMERA DIAGNOSTIC] Probe complete. Found {len(found_devices)} active physical camera device(s).")
+        logger.debug(f"[CAMERA DIAGNOSTIC] Probe complete. Found {len(found_devices)} active physical camera device(s).")
         return found_devices
 
     def _test_and_open_device(self, idx: int, backend_flag: int, backend_name: str) -> Optional[Tuple[cv2.VideoCapture, int, int, np.ndarray]]:
         """Attempts to open a specific camera index with a specific backend and reads a verification frame."""
-        logger.info(f"[CAMERA DIAGNOSTIC] Attempting camera index {idx} with backend {backend_name}...")
+        logger.debug(f"[CAMERA DIAGNOSTIC] Attempting camera index {idx} with backend {backend_name}...")
         try:
             cap = cv2.VideoCapture(idx, backend_flag)
             is_opened = cap.isOpened()
-            logger.info(f"[CAMERA DIAGNOSTIC] Index {idx} ({backend_name}) VideoCapture.isOpened(): {is_opened}")
+            logger.debug(f"[CAMERA DIAGNOSTIC] Index {idx} ({backend_name}) VideoCapture.isOpened(): {is_opened}")
 
             if not is_opened:
                 cap.release()
@@ -228,7 +228,7 @@ class CameraManager:
             # Test frame read to confirm active data stream
             ret, frame = cap.read()
             frame_valid = ret and frame is not None and frame.size > 0
-            logger.info(f"[CAMERA DIAGNOSTIC] Index {idx} ({backend_name}) frame read status: ret={ret}, valid={frame_valid}")
+            logger.debug(f"[CAMERA DIAGNOSTIC] Index {idx} ({backend_name}) frame read status: ret={ret}, valid={frame_valid}")
 
             if not frame_valid:
                 logger.warning(f"[CAMERA DIAGNOSTIC] Index {idx} ({backend_name}) opened but returned invalid frame.")
@@ -238,7 +238,7 @@ class CameraManager:
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or CAMERA_FRAME_WIDTH
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or CAMERA_FRAME_HEIGHT
             fps = float(cap.get(cv2.CAP_PROP_FPS))
-            logger.info(f"[CAMERA DIAGNOSTIC] Index {idx} ({backend_name}) SUCCESS! Detected Resolution: {w}x{h}, FPS: {fps}")
+            logger.debug(f"[CAMERA DIAGNOSTIC] Index {idx} ({backend_name}) SUCCESS! Detected Resolution: {w}x{h}, FPS: {fps}")
             return cap, w, h, frame
         except Exception as e:
             logger.error(f"[CAMERA DIAGNOSTIC] Exception while opening index {idx} with {backend_name}: {e}")
@@ -261,39 +261,79 @@ class CameraManager:
             ("CAP_DSHOW", cv2.CAP_DSHOW),
         ]
 
-        logger.info(f"[CAMERA DIAGNOSTIC] Starting physical webcam discovery. Candidates: {candidates}")
+        logger.debug(f"[CAMERA DIAGNOSTIC] Starting physical webcam discovery. Candidates: {candidates}")
 
+        dark_candidate = None
         for idx in candidates:
             for b_name, b_flag in backends:
                 res = self._test_and_open_device(idx, b_flag, b_name)
                 if res is not None:
                     cap, w, h, frame = res
-                    self._cap = cap
-                    self.camera_index = idx
-                    self.actual_resolution = (w, h)
-                    self._status = CameraStatus.REAL
-                    self._error_message = None
-                    self._consecutive_drops = 0
-                    with self._lock:
-                        self._latest_frame = frame.copy()
+                    frame_mean = float(frame.mean())
+                    if not auto_discover or frame_mean > 5.0:
+                        # Direct operator selection or active lit webcam confirmed
+                        self._cap = cap
+                        self.camera_index = idx
+                        self.actual_resolution = (w, h)
+                        self._status = CameraStatus.REAL
+                        self._error_message = None
+                        self._consecutive_drops = 0
+                        with self._lock:
+                            self._latest_frame = frame.copy()
 
-                    print("==================================================")
-                    print("  CAMERA INITIALIZATION DIAGNOSTIC")
-                    print(f"  STATUS: REAL")
-                    print(f"  DEVICE INDEX: {idx}")
-                    print(f"  BACKEND: {b_name}")
-                    print(f"  RESOLUTION: {w}x{h}")
-                    print(f"  TARGET FPS: {TARGET_FPS}")
-                    print("==================================================")
-                    logger.info(f"[CAMERA] Physical webcam confirmed and activated on index {idx} ({w}x{h}).")
+                        print("==================================================")
+                        print("  CAMERA INITIALIZATION DIAGNOSTIC")
+                        print(f"  STATUS: REAL")
+                        print(f"  DEVICE INDEX: {idx}")
+                        print(f"  BACKEND: {b_name}")
+                        print(f"  RESOLUTION: {w}x{h}")
+                        print(f"  FRAME MEAN BRIGHTNESS: {frame_mean:.1f}")
+                        print(f"  TARGET FPS: {TARGET_FPS}")
+                        print("==================================================")
+                        logger.info(f"[CAMERA] Physical webcam confirmed and activated on index {idx} ({w}x{h}, brightness={frame_mean:.1f}).")
 
-                    if self._on_device_selected is not None:
-                        try:
-                            self._on_device_selected(idx)
-                        except Exception as e:
-                            logger.error(f"Error in on_device_selected callback: {e}")
+                        if self._on_device_selected is not None:
+                            try:
+                                self._on_device_selected(idx)
+                            except Exception as e:
+                                logger.error(f"Error in on_device_selected callback: {e}")
 
-                    return True
+                        return True
+                    elif dark_candidate is None:
+                        logger.debug(f"[CAMERA DIAGNOSTIC] Candidate index {idx} opened but is dark (mean={frame_mean:.1f}). Checking other candidates...")
+                        dark_candidate = (cap, w, h, frame, idx, b_name, frame_mean)
+                    else:
+                        cap.release()
+
+        # If only dark candidate was available and no lit camera was found
+        if dark_candidate is not None:
+            cap, w, h, frame, idx, b_name, frame_mean = dark_candidate
+            self._cap = cap
+            self.camera_index = idx
+            self.actual_resolution = (w, h)
+            self._status = CameraStatus.REAL
+            self._error_message = None
+            self._consecutive_drops = 0
+            with self._lock:
+                self._latest_frame = frame.copy()
+
+            print("==================================================")
+            print("  CAMERA INITIALIZATION DIAGNOSTIC")
+            print(f"  STATUS: REAL (Dark / Shuttered Sensor)")
+            print(f"  DEVICE INDEX: {idx}")
+            print(f"  BACKEND: {b_name}")
+            print(f"  RESOLUTION: {w}x{h}")
+            print(f"  FRAME MEAN BRIGHTNESS: {frame_mean:.1f}")
+            print("==================================================")
+            logger.info(f"[CAMERA] Physical webcam activated on index {idx} (Dark sensor fallback, {w}x{h}).")
+
+            if self._on_device_selected is not None:
+                try:
+                    self._on_device_selected(idx)
+                except Exception as e:
+                    logger.error(f"Error in on_device_selected callback: {e}")
+
+            return True
 
         # Failed to open any physical camera candidate
         if self._allow_synthetic_fallback:
@@ -425,7 +465,7 @@ class CameraManager:
 
         try:
             cv2.imwrite(filepath, frame)
-            logger.info(f"[CAMERA] Evidence snapshot captured: {filepath}")
+            logger.debug(f"[CAMERA] Evidence snapshot captured: {filepath}")
             return filepath
         except Exception as e:
             logger.error(f"[CAMERA] Failed to capture snapshot: {e}")
@@ -491,7 +531,7 @@ class CameraManager:
         with self._lock:
             if self._cap is not None:
                 try:
-                    logger.info(f"[CAMERA DIAGNOSTIC] Loop terminating. Releasing VideoCapture index {self.camera_index}...")
+                    logger.debug(f"[CAMERA DIAGNOSTIC] Loop terminating. Releasing VideoCapture index {self.camera_index}...")
                     self._cap.release()
                 except Exception as e:
                     logger.error(f"[CAMERA DIAGNOSTIC] Error releasing VideoCapture in loop: {e}")

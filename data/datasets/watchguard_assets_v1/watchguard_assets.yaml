@@ -1,0 +1,28 @@
+# WatchGuard Vision - Small-Asset Prototype Dataset Configuration (Phase 5.19B)
+# Initial 4-Class Prototype: person, laptop, cell_phone, mouse
+
+path: data/datasets/watchguard_assets_v1
+train: images/train
+val: images/val
+test: images/test
+
+# Number of classes
+nc: 4
+
+# Class names mapping
+names:
+  0: person
+  1: laptop
+  2: cell_phone
+  3: mouse
+
+# Metadata & Protocol
+metadata:
+  version: "1.0.0-prototype"
+  phase: "5.19B"
+  resolution: [640, 640]
+  preprocessing: "letterbox"
+  stratification:
+    close: "area > 10000 px^2"
+    medium: "1600 <= area <= 10000 px^2"
+    far: "area < 1600 px^2"

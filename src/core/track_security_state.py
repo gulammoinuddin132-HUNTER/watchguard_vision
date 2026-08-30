@@ -105,6 +105,7 @@ class TrackSecurityState:
         self.consecutive_live_count: int = 0
         self.consecutive_spoof_count: int = 0
         self.consecutive_restricted_frames: int = 0
+        self.consecutive_outside_frames: int = 0
         self.confirmed_live: bool = False
         self.confirmed_spoof: bool = False
 

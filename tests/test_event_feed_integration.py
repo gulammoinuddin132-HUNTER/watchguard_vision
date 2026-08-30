@@ -50,8 +50,14 @@ class TestEventFeedIntegration(unittest.TestCase):
         )
 
     def tearDown(self):
+        if hasattr(self, "dashboard") and self.dashboard:
+            try:
+                self.dashboard.close(destroy_root=False)
+            except Exception:
+                pass
         try:
-            self.root.destroy()
+            if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                self.root.destroy()
         except Exception:
             pass
         self.temp_dir.cleanup()

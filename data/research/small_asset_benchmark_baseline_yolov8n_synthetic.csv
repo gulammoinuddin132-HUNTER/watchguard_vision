@@ -1,0 +1,1 @@
+Image ID,GT Label,"GT BBox (x,y,w,h)",GT Area (px^2),Distance Tier,Predicted Label,Confidence,"Pred BBox (x,y,w,h)",IoU,Is True Positive,Latency (ms)

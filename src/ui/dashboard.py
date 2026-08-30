@@ -12,14 +12,18 @@ import json
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import cv2
+import logging
 import numpy as np
 from PIL import Image, ImageTk
+
+logger = logging.getLogger("WatchGuardVision.Dashboard")
 
 from config import (
     APP_TITLE,
@@ -160,7 +164,23 @@ class WatchGuardDashboard:
         self._display_fps_timer: float = time.perf_counter()
         self._last_fps_str: str = ""
         self._last_stream_status_text: str = ""
-        self._last_stream_status_fg: str = ""
+        self._last_logged_security_state: Optional[Tuple[str, str, Optional[str], str]] = None
+        self._consecutive_green_frames: int = 0
+        self._last_render_dims: Tuple[int, int] = (640, 480)
+        self._last_canvas_dims: Tuple[int, int] = (640, 480)
+        self._last_black_bars: Tuple[int, int] = (0, 0)
+        self._cached_dim_key: Optional[Tuple[int, int, int, int]] = None
+        self._cached_crop: Tuple[int, int, int, int] = (0, 480, 0, 640)  # (y1, y2, x1, x2)
+        self._cached_render_dims: Tuple[int, int] = (640, 480)
+        self._cached_black_bars: Tuple[int, int] = (0, 0)
+        self._winmm_period_set: bool = False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeBeginPeriod(1)
+                self._winmm_period_set = True
+            except Exception:
+                pass
 
         # Setup GUI Window
         self._configure_window()
@@ -189,21 +209,67 @@ class WatchGuardDashboard:
         self.root.minsize(1150, 780)
         self.root.configure(bg=BG_DARK)
 
+        # Callback lifecycle tracking
+        self._active_after_ids: set = set()
+
         # Handle window close cleanly
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._on_destroy_event, add="+")
 
-    def _on_destroy_event(self, event=None) -> None:
-        """Ensures background worker threads and timers stop when widget is destroyed."""
-        if event is None or event.widget == self.root:
-            self._is_closed = True
-            self._ai_stop_event.set()
-            self._ai_frame_event.set()
-            if hasattr(self, "camera") and self.camera and self.camera.is_running:
+    def _safe_after(self, delay_ms: int, callback: Callable) -> Optional[str]:
+        """Schedules a timer callback and tracks its ID for deterministic cancellation."""
+        if getattr(self, "_is_closed", False) or not hasattr(self, "root") or not self.root:
+            return None
+        try:
+            if not self.root.winfo_exists():
+                return None
+            timer_id = self.root.after(delay_ms, callback)
+            if hasattr(self, "_active_after_ids"):
+                self._active_after_ids.add(timer_id)
+            return timer_id
+        except Exception:
+            return None
+
+    def _safe_after_cancel(self, timer_id: Optional[str]) -> None:
+        """Cancels a scheduled timer callback and removes its ID from tracking."""
+        if timer_id is None:
+            return
+        if hasattr(self, "_active_after_ids"):
+            self._active_after_ids.discard(timer_id)
+        if hasattr(self, "root") and self.root:
+            try:
+                self.root.after_cancel(timer_id)
+            except Exception:
+                pass
+
+    def _safe_dispatch_ui(self, func: Callable[[], None]) -> None:
+        """Dispatches a UI update callback to Tk main thread safely."""
+        if getattr(self, "_is_closed", False) or not hasattr(self, "root") or not self.root:
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+
+        aid_ref = [None]
+        def _wrapped():
+            aid = aid_ref[0]
+            if aid and hasattr(self, "_active_after_ids"):
+                self._active_after_ids.discard(aid)
+            if not getattr(self, "_is_closed", False) and hasattr(self, "root") and self.root:
                 try:
-                    self.camera.stop()
+                    if self.root.winfo_exists():
+                        func()
                 except Exception:
                     pass
+
+        aid_ref[0] = self._safe_after(0, _wrapped)
+
+    def _on_destroy_event(self, event=None) -> None:
+        """Ensures background worker threads and timers stop when widget is destroyed."""
+        if event is None or getattr(event, "widget", None) == self.root:
+            self.close(destroy_root=False)
 
     def _setup_styles(self) -> None:
         """Configures ttk styles for dark modern high-contrast look."""
@@ -218,7 +284,7 @@ class WatchGuardDashboard:
             fieldbackground=TABLE_BG,
             borderwidth=0,
             font=FONT_SMALL,
-            rowheight=24,
+            rowheight=16,
         )
         self.style.configure(
             "Events.Treeview.Heading",
@@ -260,29 +326,43 @@ class WatchGuardDashboard:
 
         # Main Workspace Container
         main_workspace = tk.Frame(self.root, bg=BG_DARK)
-        main_workspace.grid(row=1, column=0, sticky="nsew", padx=10, pady=(2, 6))
-        main_workspace.grid_rowconfigure(0, weight=0)  # Row 0: UPPER_AREA (bounded height ~395px)
-        main_workspace.grid_rowconfigure(1, weight=0)  # Row 1: CAMERA_CONTROLS_BAR (compact height ~36px)
-        main_workspace.grid_rowconfigure(2, weight=1, minsize=300)  # Row 2: EVENT_LOG_AREA (Guaranteed >= 300px)
+        main_workspace.grid(row=1, column=0, sticky="nsew", padx=10, pady=(2, 4))
+        main_workspace.grid_rowconfigure(0, weight=1)  # Row 0: UPPER_AREA absorbs vertical space (Camera dominates, zero bottom gap)
+        main_workspace.grid_rowconfigure(1, weight=0)  # Row 1: CAMERA_CONTROLS_BAR (compact ~36-38px height)
+        main_workspace.grid_rowconfigure(2, weight=0, minsize=100)  # Row 2: VERY COMPACT EVENT LOG (~115-125px, sits at bottom)
         main_workspace.grid_columnconfigure(0, weight=1)
 
-        # Row 0: Upper Section (Video Feed Left + Security Intelligence Right)
+        # Row 0: Upper Section (Dominant Video Feed Left ~68-70% + Vertical Dashboard Right ~30-32%)
         upper_area = tk.Frame(main_workspace, bg=BG_DARK)
         upper_area.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
         upper_area.grid_rowconfigure(0, weight=1)
-        upper_area.grid_columnconfigure(0, weight=1)  # Left video column expands horizontally
-        upper_area.grid_columnconfigure(1, weight=0)  # Right panel fixed width (470px)
+        upper_area.grid_columnconfigure(0, weight=1, minsize=840)  # Left video column (~840-870px wide, ~68-70%)
+        upper_area.grid_columnconfigure(1, weight=0, minsize=390)  # Right vertical dashboard (380-400px wide, ~30-32%)
 
-        # Left Column: Video Card
+        # Left Column: Large Dominant Video Card
         self._build_video_card(upper_area)
 
-        # Right Column: Fixed 470px Container for 4 Compact Cards
-        right_panel = tk.Frame(upper_area, bg=BG_DARK, width=470)
+        # Right Column: Vertical Security Dashboard (4 Stacked Cards - Geometry Frozen at 390px)
+        right_panel = tk.Frame(upper_area, bg=BG_DARK, width=390, height=632)
         right_panel.grid(row=0, column=1, sticky="nsew")
+        right_panel.grid_propagate(False)
+        right_panel.pack_propagate(False)
+        right_panel.grid_rowconfigure(0, weight=0)
+        right_panel.grid_rowconfigure(1, weight=0)
+        right_panel.grid_rowconfigure(2, weight=0)
+        right_panel.grid_rowconfigure(3, weight=0)
+        right_panel.grid_columnconfigure(0, weight=1)
 
+        # Tier 1 (TOP): Security Threat Level
         self._build_risk_panel(right_panel)
+
+        # Tier 2 (SECOND): Context & Security Intelligence
         self._build_context_intelligence_card(right_panel)
+
+        # Tier 3 (THIRD): Vision Telemetry (stacked vertically)
         self._build_telemetry_card(right_panel)
+
+        # Tier 4 (FOURTH): Voice Assistant (stacked vertically)
         self._build_voice_assistant_card(right_panel)
 
         # Row 1: Horizontal Camera & Scenario Controls Bar
@@ -346,12 +426,12 @@ class WatchGuardDashboard:
         self.video_card = CardFrame(parent, title="Live Video Stream & Vision HUD")
         self.video_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
-        # Canvas for rendering video frames (bounded 350px height)
+        # Canvas for large video display (4:3 aspect ratio: 640x480)
         self.video_canvas = tk.Canvas(
             self.video_card,
             bg="#000000",
-            width=VIDEO_DISPLAY_WIDTH,
-            height=350,
+            width=640,
+            height=480,
             highlightthickness=0,
         )
         self.video_canvas.pack(fill="both", expand=True, padx=4, pady=3)
@@ -361,7 +441,7 @@ class WatchGuardDashboard:
 
     def _build_camera_controls(self, parent: tk.Frame) -> None:
         """Builds compact horizontal controls bar across row 1."""
-        ctrl_card = CardFrame(parent, title="Camera & Scenario Controls")
+        ctrl_card = CardFrame(parent)  # Streamlined container without redundant header
         ctrl_card.grid(row=1, column=0, sticky="ew", pady=(0, 4))
 
         bar = tk.Frame(ctrl_card, bg=CARD_BG, padx=6, pady=2)
@@ -492,10 +572,12 @@ class WatchGuardDashboard:
 
     def _build_risk_panel(self, parent: tk.Frame) -> None:
         """Builds the Security Status & Risk Meter."""
-        risk_card = CardFrame(parent, title="Security Threat Level")
-        risk_card.pack(fill="x", pady=(0, 2))
+        risk_card = CardFrame(parent, title="Security Threat Level", height=95, width=390)
+        risk_card.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        risk_card.pack_propagate(False)
+        risk_card.grid_propagate(False)
 
-        inner = tk.Frame(risk_card, bg=CARD_BG, padx=6, pady=2)
+        inner = tk.Frame(risk_card, bg=CARD_BG, padx=4, pady=1)
         inner.pack(fill="x")
 
         self.risk_banner = RiskBanner(inner)
@@ -503,7 +585,7 @@ class WatchGuardDashboard:
 
         # Quick Manual Risk simulation buttons (for test & demo verification)
         sim_frame = tk.Frame(inner, bg=CARD_BG)
-        sim_frame.pack(fill="x", pady=(2, 0))
+        sim_frame.pack(fill="x", pady=(1, 0))
 
         lbl_test = tk.Label(
             sim_frame,
@@ -535,52 +617,63 @@ class WatchGuardDashboard:
             btn.pack(side="left", padx=1)
 
     def _build_context_intelligence_card(self, parent: tk.Frame) -> None:
-        """Builds the Context & Security Intelligence card (Phase 2.3 Active)."""
-        card = CardFrame(parent, title="Context & Security Intelligence (Phase 2.3 Active)")
-        card.pack(fill="x", pady=(0, 2))
+        """Builds the Context & Security Intelligence card."""
+        card = CardFrame(parent, title="Context & Security Intelligence", height=220, width=390)
+        card.grid(row=1, column=0, sticky="nsew", pady=(0, 4))
+        card.pack_propagate(False)
+        card.grid_propagate(False)
 
-        content = tk.Frame(card, bg=CARD_BG, padx=6, pady=2)
+        content = tk.Frame(card, bg=CARD_BG, padx=4, pady=1)
         content.pack(fill="x")
 
         # Row 1: Person (left) & Zone (right)
         row1 = tk.Frame(content, bg=CARD_BG)
         row1.pack(fill="x")
         self.ctx_item_person = TelemetryItem(row1, "Person:", "None")
-        self.ctx_item_person.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.ctx_item_person.pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.ctx_item_zone = TelemetryItem(row1, "Zone:", "Perimeter")
-        self.ctx_item_zone.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.ctx_item_zone.pack(side="right", fill="x", expand=True, padx=(3, 0))
 
         # Row 2: Objects (left) & Time (right)
         row2 = tk.Frame(content, bg=CARD_BG)
         row2.pack(fill="x")
         self.ctx_item_object = TelemetryItem(row2, "Objects:", "None")
-        self.ctx_item_object.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.ctx_item_object.pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.ctx_item_time = TelemetryItem(row2, "Time:", "--:--")
-        self.ctx_item_time.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.ctx_item_time.pack(side="right", fill="x", expand=True, padx=(3, 0))
 
         # Row 3 (Phase 4.1): Zone State/Duration (left) & Distinct Violations (right)
         row3 = tk.Frame(content, bg=CARD_BG)
         row3.pack(fill="x")
         self.ctx_item_zone_state = TelemetryItem(row3, "Occupancy:", "OUTSIDE")
-        self.ctx_item_zone_state.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.ctx_item_zone_state.pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.ctx_item_violations = TelemetryItem(row3, "Violations:", "0 Distinct")
-        self.ctx_item_violations.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.ctx_item_violations.pack(side="right", fill="x", expand=True, padx=(3, 0))
 
         # Row 4 (Phase 5): Spoofs (left) & After-Hours Violations (right)
         row4 = tk.Frame(content, bg=CARD_BG)
         row4.pack(fill="x")
         self.ctx_item_analytics_spoofs = TelemetryItem(row4, "Spoofs Today:", "0")
-        self.ctx_item_analytics_spoofs.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.ctx_item_analytics_spoofs.pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.ctx_item_analytics_after_hours = TelemetryItem(row4, "After-Hours:", "0")
-        self.ctx_item_analytics_after_hours.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.ctx_item_analytics_after_hours.pack(side="right", fill="x", expand=True, padx=(3, 0))
 
-        # Decision row
-        self.ctx_item_decision = TelemetryItem(content, "Decision:", "STANDBY")
-        self.ctx_item_decision.pack(fill="x")
+        # Row 5 (Phase 5.16.13): Authority (Authoritative Baseline - Full Width)
+        row5 = tk.Frame(content, bg=CARD_BG)
+        row5.pack(fill="x")
+        self.ctx_item_decision = TelemetryItem(row5, "Authority:", "STANDBY")
+        self.ctx_item_decision.pack(fill="x", expand=True)
+
+        # Row 6 (Phase 5.16.13): CCSDF Research Layer Telemetry (Full Width for unclipped R=0.xx [ACTION])
+        row6 = tk.Frame(content, bg=CARD_BG)
+        row6.pack(fill="x")
+        self.ctx_item_ccsdf = TelemetryItem(row6, "CCSDF Risk:", "STANDBY")
+        self.ctx_item_ccsdf.pack(fill="x", expand=True)
 
         # Incident Lifecycle & Action Row (Phase 4)
-        inc_frame = tk.Frame(content, bg=CARD_BG)
+        inc_frame = tk.Frame(content, bg=CARD_BG, height=22)
         inc_frame.pack(fill="x", pady=(1, 0))
+        inc_frame.pack_propagate(False)
 
         self.ctx_item_incident = TelemetryItem(inc_frame, "Incident:", "None")
         self.ctx_item_incident.pack(side="left", fill="x", expand=True)
@@ -592,7 +685,7 @@ class WatchGuardDashboard:
             bg="#D97706",
             fg="#FFFFFF",
             relief="flat",
-            padx=4,
+            padx=3,
             pady=0,
             cursor="hand2",
             command=self._on_ack_incident_clicked,
@@ -606,7 +699,7 @@ class WatchGuardDashboard:
             bg="#10B981",
             fg="#FFFFFF",
             relief="flat",
-            padx=4,
+            padx=3,
             pady=0,
             cursor="hand2",
             command=self._on_resolve_incident_clicked,
@@ -625,7 +718,7 @@ class WatchGuardDashboard:
             bg=CARD_BG,
             fg=TEXT_MUTED,
             anchor="nw",
-        ).pack(side="left", padx=(0, 4), anchor="nw")
+        ).pack(side="left", padx=(0, 3), anchor="nw")
 
         self.lbl_ctx_reason = BoundedTextViewport(
             reason_frame,
@@ -639,55 +732,60 @@ class WatchGuardDashboard:
 
     def _build_telemetry_card(self, parent: tk.Frame) -> None:
         """Builds active detection telemetry stats with Phase 3 PAD Liveness rows."""
-        card = CardFrame(parent, title="Vision Telemetry (Phases 2.1, 2.2 & 3.0 Active)")
-        card.pack(fill="x", pady=(0, 2))
+        card = CardFrame(parent, title="Vision Telemetry", height=115, width=390)
+        card.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
+        card.pack_propagate(False)
+        card.grid_propagate(False)
 
-        content = tk.Frame(card, bg=CARD_BG, padx=6, pady=2)
+        content = tk.Frame(card, bg=CARD_BG, padx=4, pady=1)
         content.pack(fill="x")
 
-        # Compact 2-column grid for telemetry items
+        # 4 rows of 2 items each, filling 350px width comfortably
+        pad_name = getattr(getattr(self.person_engine, "pad_manager", None), "active_model_name", "Blink-EAR")
+
         row1 = tk.Frame(content, bg=CARD_BG)
         row1.pack(fill="x")
         self.item_person = TelemetryItem(row1, "Face AI:", "STANDBY")
-        self.item_person.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.item_person.pack(side="left", fill="x", expand=True)
         self.item_registered_faces = TelemetryItem(row1, "Profiles:", f"{self.person_engine.known_face_count}")
-        self.item_registered_faces.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.item_registered_faces.pack(side="right", fill="x", expand=True)
 
         row2 = tk.Frame(content, bg=CARD_BG)
         row2.pack(fill="x")
         self.item_objects = TelemetryItem(row2, "Object AI:", "STANDBY")
-        self.item_objects.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.item_objects.pack(side="left", fill="x", expand=True)
         self.item_db_records = TelemetryItem(row2, "DB Events:", "0")
-        self.item_db_records.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.item_db_records.pack(side="right", fill="x", expand=True)
 
         row3 = tk.Frame(content, bg=CARD_BG)
         row3.pack(fill="x")
         self.item_liveness = TelemetryItem(row3, "Liveness:", "STANDBY")
-        self.item_liveness.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        pad_name = getattr(getattr(self.person_engine, "pad_manager", None), "active_model_name", "Blink-EAR")
-        self.item_pad_model = TelemetryItem(row3, "PAD Model:", f"{pad_name}")
-        self.item_pad_model.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.item_liveness.pack(side="left", fill="x", expand=True)
+        self.item_pad_latency = TelemetryItem(row3, "PAD Latency:", "-- ms")
+        self.item_pad_latency.pack(side="right", fill="x", expand=True)
 
         row4 = tk.Frame(content, bg=CARD_BG)
         row4.pack(fill="x")
         self.item_access = TelemetryItem(row4, "Access:", "STANDBY")
-        self.item_access.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self.item_pad_latency = TelemetryItem(row4, "PAD Latency:", "-- ms")
-        self.item_pad_latency.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        self.item_access.pack(side="left", fill="x", expand=True)
+        self.item_pad_model = TelemetryItem(row4, "PAD Model:", f"{pad_name}")
+        self.item_pad_model.pack(side="right", fill="x", expand=True)
 
     def _build_voice_assistant_card(self, parent: tk.Frame) -> None:
-        """Builds the Voice Assistant Status & Interaction Card (Phase 2.4 Active)."""
-        card = CardFrame(parent, title="Voice Assistant (Phase 2.4 Active)")
-        card.pack(fill="x", pady=(0, 0))
+        """Builds the Voice Assistant Status & Interaction Card."""
+        card = CardFrame(parent, title="Voice Assistant", height=190, width=390)
+        card.grid(row=3, column=0, sticky="nsew")
+        card.pack_propagate(False)
+        card.grid_propagate(False)
 
-        content = tk.Frame(card, bg=CARD_BG, padx=6, pady=2)
+        content = tk.Frame(card, bg=CARD_BG, padx=4, pady=1)
         content.pack(fill="x")
 
         # Row 1: Status & Mute Checkbox
         status_row = tk.Frame(content, bg=CARD_BG)
         status_row.pack(fill="x")
 
-        self.item_voice_status = TelemetryItem(status_row, "Status:", "● READY / STANDBY")
+        self.item_voice_status = TelemetryItem(status_row, "Status:", "● READY")
         self.item_voice_status.pack(side="left", fill="x", expand=True)
 
         self.mute_var = tk.BooleanVar(value=False)
@@ -703,14 +801,14 @@ class WatchGuardDashboard:
             activeforeground=TEXT_PRIMARY,
             command=self._on_mute_toggled,
         )
-        chk_mute.pack(side="right", padx=(4, 0))
+        chk_mute.pack(side="right", padx=(2, 0))
 
         # Row 2: Last Command
         self.item_voice_command = TelemetryItem(content, "Last Query:", "None")
         self.item_voice_command.pack(fill="x")
 
         # Row 3: Response display with BoundedTextViewport (Zero parent geometry expansion)
-        resp_frame = tk.Frame(content, bg=CARD_BG, height=26)
+        resp_frame = tk.Frame(content, bg=CARD_BG, height=36)
         resp_frame.pack(fill="x", pady=(1, 1))
         resp_frame.pack_propagate(False)
 
@@ -725,7 +823,7 @@ class WatchGuardDashboard:
 
         self.lbl_voice_resp = BoundedTextViewport(
             resp_frame,
-            height_px=24,
+            height_px=34,
             bg=CARD_BG,
             fg=TEXT_PRIMARY,
             font=FONT_SMALL,
@@ -739,15 +837,15 @@ class WatchGuardDashboard:
 
         self.btn_ptt = tk.Button(
             action_row,
-            text="🎙️ PTT (3.5s)",
+            text="🎙️ PTT",
             font=FONT_BODY_BOLD,
             bg="#2563EB",
             fg="#FFFFFF",
             activebackground="#1D4ED8",
             activeforeground="#FFFFFF",
             relief="flat",
-            padx=6,
-            pady=1,
+            padx=4,
+            pady=0,
             cursor="hand2",
             command=self._on_ptt_clicked,
         )
@@ -759,6 +857,7 @@ class WatchGuardDashboard:
             bg="#0F172A",
             fg=TEXT_PRIMARY,
             insertbackground="#FFFFFF",
+            width=12,
         )
         self.ent_voice_query.pack(side="left", fill="x", expand=True, padx=(0, 4))
         self.ent_voice_query.insert(0, "What happened recently?")
@@ -771,64 +870,65 @@ class WatchGuardDashboard:
             bg=BTN_NEUTRAL_BG,
             fg=TEXT_PRIMARY,
             relief="groove",
-            padx=6,
-            pady=1,
+            padx=4,
+            pady=0,
             cursor="hand2",
             command=self._on_send_text_query,
         )
         self.btn_ask.pack(side="right")
 
     def _build_event_feed(self, parent: tk.Frame) -> None:
-        """Builds the bottom tabular live event feed with high-contrast text and two-way scrolling."""
+        """Builds the compact bottom tabular live event feed (~3 visible rows)."""
         card = CardFrame(parent, title="Real-Time Security Event Log")
-        card.grid(row=2, column=0, sticky="nsew")
+        card.grid(row=2, column=0, sticky="ew", pady=(0, 2))
 
-        # Action Toolbar above table
-        toolbar = tk.Frame(card, bg=CARD_BG, padx=6, pady=3)
-        toolbar.pack(fill="x", padx=6, pady=(0, 2))
+        # Integrated action header on right of CardFrame header
+        if hasattr(card, "header_frame"):
+            right_box = tk.Frame(card.header_frame, bg=CARD_HEADER_BG)
+            right_box.pack(side="right", padx=4)
 
-        btn_refresh = tk.Button(
-            toolbar,
-            text="🔄 Refresh Events",
-            font=FONT_BODY_BOLD,
-            bg="#2563EB",
-            fg="#FFFFFF",
-            activebackground="#1D4ED8",
-            activeforeground="#FFFFFF",
-            relief="flat",
-            padx=8,
-            pady=2,
-            cursor="hand2",
-            command=self._load_recent_events,
-        )
-        btn_refresh.pack(side="left", padx=(0, 6))
+            self.lbl_table_status = tk.Label(
+                right_box,
+                text="● Live Sync Active (Newest First)",
+                font=FONT_SMALL,
+                bg=CARD_HEADER_BG,
+                fg=COLOR_GREEN,
+            )
+            self.lbl_table_status.pack(side="right", padx=(6, 0))
 
-        btn_clear_ui = tk.Button(
-            toolbar,
-            text="🧹 Clear Table View",
-            font=FONT_SMALL,
-            bg=BTN_NEUTRAL_BG,
-            fg=TEXT_PRIMARY,
-            relief="groove",
-            padx=6,
-            pady=2,
-            cursor="hand2",
-            command=self._clear_treeview,
-        )
-        btn_clear_ui.pack(side="left", padx=(0, 8))
+            btn_clear_ui = tk.Button(
+                right_box,
+                text="🧹 Clear History",
+                font=FONT_SMALL,
+                bg=BTN_NEUTRAL_BG,
+                fg=TEXT_PRIMARY,
+                relief="groove",
+                padx=4,
+                pady=0,
+                cursor="hand2",
+                command=self._on_clear_event_history_clicked,
+            )
+            btn_clear_ui.pack(side="right", padx=(4, 0))
 
-        self.lbl_table_status = tk.Label(
-            toolbar,
-            text="● Live Sync Active (Newest First)",
-            font=FONT_SMALL,
-            bg=CARD_BG,
-            fg=COLOR_GREEN,
-        )
-        self.lbl_table_status.pack(side="left")
+            btn_refresh = tk.Button(
+                right_box,
+                text="🔄 Refresh Events",
+                font=FONT_SMALL,
+                bg="#2563EB",
+                fg="#FFFFFF",
+                activebackground="#1D4ED8",
+                activeforeground="#FFFFFF",
+                relief="flat",
+                padx=4,
+                pady=0,
+                cursor="hand2",
+                command=self._load_recent_events,
+            )
+            btn_refresh.pack(side="right", padx=(4, 0))
 
-        # Treeview table container
+        # Treeview table container (compact ~60-75px for ~3 visible rows)
         tree_frame = tk.Frame(card, bg=CARD_BG)
-        tree_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        tree_frame.pack(fill="x", padx=4, pady=(1, 2))
 
         columns = ("id", "timestamp", "risk", "type", "description")
         self.tree = ttk.Treeview(
@@ -837,6 +937,7 @@ class WatchGuardDashboard:
             show="headings",
             style="Events.Treeview",
             selectmode="browse",
+            height=3,
         )
 
         self.tree.heading("id", text="#", anchor="center")
@@ -849,7 +950,7 @@ class WatchGuardDashboard:
         self.tree.column("timestamp", width=155, minwidth=140, anchor="w", stretch=False)
         self.tree.column("risk", width=150, minwidth=135, anchor="center", stretch=False)
         self.tree.column("type", width=190, minwidth=165, anchor="w", stretch=False)
-        self.tree.column("description", width=620, minwidth=350, anchor="w", stretch=True)
+        self.tree.column("description", width=800, minwidth=400, anchor="w", stretch=False)
 
         # Vertical & Horizontal Scrollbars
         v_scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -874,10 +975,10 @@ class WatchGuardDashboard:
 
     def _render_placeholder_frame(self, message: str) -> None:
         """Draws a standby graphic on the canvas when video is inactive."""
-        w = max(VIDEO_DISPLAY_WIDTH, self.video_canvas.winfo_width())
-        h = max(390, self.video_canvas.winfo_height())
+        w = max(600, self.video_canvas.winfo_width())
+        h = max(450, self.video_canvas.winfo_height())
         if w < 10 or h < 10:
-            w, h = VIDEO_DISPLAY_WIDTH, 390
+            w, h = 600, 450
 
         img = np.zeros((h, w, 3), dtype=np.uint8)
 
@@ -1004,8 +1105,18 @@ class WatchGuardDashboard:
         overlays latest completed AI security annotations, and renders to canvas.
         Zero blocking on AI inference.
         """
-        if self._is_closed:
+        if getattr(self, "_is_closed", False) or not hasattr(self, "root") or not self.root:
             return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+
+        # Cancel/discard the timer ID that triggered this cycle
+        if getattr(self, "_after_video_id", None) is not None:
+            self._safe_after_cancel(self._after_video_id)
+            self._after_video_id = None
 
         loop_start = time.perf_counter()
 
@@ -1017,7 +1128,7 @@ class WatchGuardDashboard:
                     self._ai_input_frame = frame_bgr.copy()
                     self._ai_frame_event.set()
 
-                annotated_bgr = frame_bgr.copy()
+                annotated_bgr = frame_bgr
 
                 # 2. Retrieve latest completed AI state atomically
                 with self._state_lock:
@@ -1044,19 +1155,51 @@ class WatchGuardDashboard:
                             context_decision=decision,
                         )
 
-                # 5. Convert to RGB and render onto Tkinter canvas
-                frame_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                canvas_w = max(50, self.video_canvas.winfo_width())
-                canvas_h = max(50, self.video_canvas.winfo_height())
-                frame_resized = cv2.resize(frame_rgb, (canvas_w, canvas_h))
+                try:
+                    # 5. Convert to RGB and render onto Tkinter canvas
+                    # Natural, scene-preserving camera framing: 100% full field of view, no cropping, no zoom!
+                    # Preserves natural aspect ratio with symmetrical bars rendered natively by canvas.
+                    frame_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                    canvas_w = max(50, self.video_canvas.winfo_width())
+                    canvas_h = max(50, self.video_canvas.winfo_height())
+                    h_frame, w_frame = frame_rgb.shape[:2]
 
-                pil_img = Image.fromarray(frame_resized)
-                self._photo_image = ImageTk.PhotoImage(image=pil_img, master=self.root)
-                if self._canvas_img_id is None:
-                    self.video_canvas.delete("all")
-                    self._canvas_img_id = self.video_canvas.create_image(0, 0, image=self._photo_image, anchor="nw")
-                else:
-                    self.video_canvas.itemconfig(self._canvas_img_id, image=self._photo_image)
+                    dim_key = (canvas_w, canvas_h, w_frame, h_frame)
+                    if dim_key != self._cached_dim_key:
+                        self._cached_dim_key = dim_key
+
+                        # Scene-preserving aspect-ratio fit: 100% full field of view, no crop, no over-zoom
+                        fit_scale = min(canvas_w / float(w_frame), canvas_h / float(h_frame))
+                        target_w = max(1, math.floor(w_frame * fit_scale))
+                        target_h = max(1, math.floor(h_frame * fit_scale))
+                        x_off = max(0, (canvas_w - target_w) // 2)
+                        y_off = max(0, (canvas_h - target_h) // 2)
+
+                        self._cached_crop = (0, h_frame, 0, w_frame)
+                        self._cached_render_dims = (target_w, target_h)
+                        self._cached_black_bars = (x_off, y_off)
+
+                    crop_y1, crop_y2, crop_x1, crop_x2 = self._cached_crop
+                    target_w, target_h = self._cached_render_dims
+                    x_off, y_off = self._cached_black_bars
+
+                    self._last_render_dims = (target_w, target_h)
+                    self._last_canvas_dims = (canvas_w, canvas_h)
+                    self._last_black_bars = (x_off, y_off)
+
+                    cropped_rgb = frame_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
+                    frame_resized = cv2.resize(cropped_rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+                    pil_img = Image.fromarray(frame_resized)
+                    self._photo_image = ImageTk.PhotoImage(image=pil_img, master=self.root)
+                    if self._canvas_img_id is None or not self.video_canvas.find_withtag(self._canvas_img_id):
+                        self.video_canvas.delete("all")
+                        self._canvas_img_id = self.video_canvas.create_image(x_off, y_off, image=self._photo_image, anchor="nw")
+                    else:
+                        self.video_canvas.coords(self._canvas_img_id, x_off, y_off)
+                        self.video_canvas.itemconfig(self._canvas_img_id, image=self._photo_image)
+                except Exception as render_err:
+                    logger.debug(f"[CAMERA RENDER] Exception during frame canvas render: {render_err}")
 
                 # Track display FPS
                 self._display_frame_count += 1
@@ -1071,19 +1214,26 @@ class WatchGuardDashboard:
         target_interval_ms = 1000.0 / 30.0
         delay_ms = max(1, int(target_interval_ms - elapsed_ms))
 
-        if not self._is_closed:
-            try:
-                self._after_video_id = self.root.after(delay_ms, self._schedule_video_update)
-            except Exception:
-                pass
+        if not getattr(self, "_is_closed", False):
+            self._after_video_id = self._safe_after(delay_ms, self._schedule_video_update)
 
     def _schedule_ui_telemetry_update(self) -> None:
         """
         Decoupled UI refresh loop running at ~10 Hz (100ms).
         Updates text labels, telemetry cards, and risk meter only when state changes.
         """
-        if self._is_closed:
+        if getattr(self, "_is_closed", False) or not hasattr(self, "root") or not self.root:
             return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+
+        # Cancel/discard the timer ID that triggered this cycle
+        if getattr(self, "_after_ui_id", None) is not None:
+            self._safe_after_cancel(self._after_ui_id)
+            self._after_ui_id = None
 
         state = self._latest_vision_state
         if state is not None and self.camera.is_running:
@@ -1137,11 +1287,8 @@ class WatchGuardDashboard:
                 self.lbl_stream_status.configure(text=stat_text, fg=stat_fg)
 
         # Re-schedule next decoupled UI update loop (100ms = 10 Hz)
-        if not self._is_closed:
-            try:
-                self._after_ui_id = self.root.after(100, self._schedule_ui_telemetry_update)
-            except Exception:
-                pass
+        if not getattr(self, "_is_closed", False):
+            self._after_ui_id = self._safe_after(100, self._schedule_ui_telemetry_update)
 
     def _handle_object_detection_telemetry(self, results: Dict[str, Any]) -> None:
         """Updates Object Detection telemetry card."""
@@ -1271,6 +1418,18 @@ class WatchGuardDashboard:
         dec_color = decision.risk_level.color_hex
         self.ctx_item_decision.set_value(f"{decision.decision} [{decision.risk_level.value}]", dec_color)
 
+        # Update CCSDF Research Layer Telemetry (Phase 5.16)
+        if hasattr(self, "ctx_item_ccsdf"):
+            cc_res = getattr(decision, "ccsdf_result", None)
+            if cc_res:
+                r_score = cc_res.get("risk_score", 0.0)
+                raw_rec = cc_res.get("recommended_action", "ALLOW")
+                r_rec = "VERIFY" if raw_rec == "PENDING_VERIFICATION" else raw_rec
+                r_col = COLOR_GREEN if raw_rec == "ALLOW" else (COLOR_YELLOW if raw_rec in ("ATTENTION", "PENDING_VERIFICATION") else (COLOR_ORANGE if raw_rec == "RESTRICT" else COLOR_RED))
+                self.ctx_item_ccsdf.set_value(f"R={r_score:.2f} [{r_rec}]", r_col)
+            else:
+                self.ctx_item_ccsdf.set_value("STANDBY", TEXT_MUTED)
+
         # Update Zone State, Duration & Violation Telemetry (Phase 4.1)
         per_tracks = getattr(decision, "per_track_states", [])
         if per_tracks:
@@ -1328,45 +1487,64 @@ class WatchGuardDashboard:
         # 2. Update Master Risk Banner
         self.risk_banner.update_risk(decision.risk_level, decision.reason)
 
-        # 3. Handle Debounced Security Event Dispatching & Evidence Snapshot
+        # 3. Handle Edge-Triggered Security Event Dispatching & Evidence Snapshot (State Transition Logging)
         if decision.risk_level in (RiskLevel.YELLOW, RiskLevel.ORANGE, RiskLevel.RED):
-            rule_sig = f"{decision.decision}_{p_name}_{obj_summary}"
-            if self.context_engine.should_trigger_alert(rule_sig):
-                snap_path = None
-                if decision.evidence_required and self.camera.is_running:
-                    snap_path = self.camera.capture_snapshot(filename_prefix=f"evidence_{decision.decision.lower()}")
+            self._consecutive_green_frames = 0
+            current_state = (
+                decision.risk_level.value,
+                decision.decision,
+                p_name if p_name != "None" else None,
+                ctx.get("zone_name", "Standard Perimeter"),
+            )
 
-                meta_dict = {
-                    "person_identity": p_name,
-                    "zone": ctx.get("zone_name", "Standard Perimeter"),
-                    "current_time": ctx.get("time_str", "--:--"),
-                    "authorized_hours_status": "NORMAL HOURS" if ctx.get("is_authorized_hours") else "AFTER HOURS",
-                    "authorized_hours_window": f"{self.context_engine.hours_start}–{self.context_engine.hours_end}",
-                    "final_decision": decision.decision,
-                    "risk_level": decision.risk_level.value,
-                    "traceable_reason": decision.reason,
-                    "is_access_granted": decision.is_access_granted,
-                }
+            # Edge-triggered check: only log when transitioning into or changing security threat states
+            if current_state != self._last_logged_security_state:
+                rule_sig = f"{decision.decision}_{p_name}_{ctx.get('zone_name', 'Standard Perimeter')}"
+                if self.context_engine.should_trigger_alert(rule_sig):
+                    snap_path = None
+                    if decision.evidence_required and self.camera.is_running:
+                        snap_path = self.camera.capture_snapshot(filename_prefix=f"evidence_{decision.decision.lower()}")
 
-                self.logger.log_event(
-                    event_type=decision.event_type,
-                    risk_level=decision.risk_level,
-                    description=decision.reason,
-                    evidence_frame_path=snap_path,
-                    person_name=p_name if p_name != "None" else None,
-                    object_summary=obj_summary if obj_summary != "None" else None,
-                    metadata_json=json.dumps(meta_dict),
-                )
+                    meta_dict = {
+                        "person_identity": p_name,
+                        "zone": ctx.get("zone_name", "Standard Perimeter"),
+                        "current_time": ctx.get("time_str", "--:--"),
+                        "authorized_hours_status": "NORMAL HOURS" if ctx.get("is_authorized_hours") else "AFTER HOURS",
+                        "authorized_hours_window": f"{self.context_engine.hours_start}–{self.context_engine.hours_end}",
+                        "final_decision": decision.decision,
+                        "risk_level": decision.risk_level.value,
+                        "traceable_reason": decision.reason,
+                        "is_access_granted": decision.is_access_granted,
+                    }
 
-        # Also log verified authorized entry once per arrival
-        elif decision.risk_level == RiskLevel.GREEN and ctx.get("is_authorized"):
-            if self.person_engine.should_trigger_alert(f"auth_arrival_{p_name}"):
-                self.logger.log_event(
-                    event_type=EventType.AUTHORIZED_PERSON,
-                    risk_level=RiskLevel.GREEN,
-                    description=f"Authorized personnel arrival verified: {p_name}.",
-                    person_name=p_name,
-                )
+                    self.logger.log_event(
+                        event_type=decision.event_type,
+                        risk_level=decision.risk_level,
+                        description=decision.reason,
+                        evidence_frame_path=snap_path,
+                        person_name=p_name if p_name != "None" else None,
+                        object_summary=obj_summary if obj_summary != "None" else None,
+                        metadata_json=json.dumps(meta_dict),
+                    )
+                # Mark state as logged so persistent condition produces no repeated events
+                self._last_logged_security_state = current_state
+
+        elif decision.risk_level == RiskLevel.GREEN:
+            self._consecutive_green_frames += 1
+            # Debounce clearance: require sustained absence/clear perimeter (>= 30 frames, ~1s)
+            if self._consecutive_green_frames >= 30:
+                if self._last_logged_security_state is not None:
+                    self._last_logged_security_state = None
+
+            # Also log verified authorized entry once per arrival
+            if ctx.get("is_authorized"):
+                if self.person_engine.should_trigger_alert(f"auth_arrival_{p_name}"):
+                    self.logger.log_event(
+                        event_type=EventType.AUTHORIZED_PERSON,
+                        risk_level=RiskLevel.GREEN,
+                        description=f"Authorized personnel arrival verified: {p_name}.",
+                        person_name=p_name,
+                    )
 
     def _on_ack_incident_clicked(self) -> None:
         """Handles operator click on ACK incident button."""
@@ -1400,18 +1578,18 @@ class WatchGuardDashboard:
         """Thread-safe UI callback for voice assistant status changes."""
         def update_ui():
             if status == "LISTENING":
-                self.item_voice_status.set_value("● LISTENING (Speak now...)", COLOR_YELLOW)
-                self.btn_ptt.configure(bg="#D97706", text="🎙️ LISTENING...")
+                self.item_voice_status.set_value("● LISTENING", COLOR_YELLOW)
+                self.btn_ptt.configure(bg="#D97706", text="🎙️ MIC ON")
             elif status == "PROCESSING":
-                self.item_voice_status.set_value("● PROCESSING QUERY...", ACCENT_BLUE)
-                self.btn_ptt.configure(bg="#2563EB", text="⏳ PROCESSING...")
+                self.item_voice_status.set_value("● PROCESSING", ACCENT_BLUE)
+                self.btn_ptt.configure(bg="#2563EB", text="⏳ WAIT")
             elif status == "SPEAKING":
-                self.item_voice_status.set_value("● SPEAKING RESPONSE...", COLOR_GREEN)
-                self.btn_ptt.configure(bg="#2563EB", text="🎤 PTT (3.5s)")
+                self.item_voice_status.set_value("● SPEAKING", COLOR_GREEN)
+                self.btn_ptt.configure(bg="#2563EB", text="🎙️ PTT")
             else:
-                self.item_voice_status.set_value("● READY / STANDBY", TEXT_MUTED)
-                self.btn_ptt.configure(bg="#2563EB", text="🎤 PTT (3.5s)")
-        self.root.after(0, update_ui)
+                self.item_voice_status.set_value("● READY", TEXT_MUTED)
+                self.btn_ptt.configure(bg="#2563EB", text="🎙️ PTT")
+        self._safe_dispatch_ui(update_ui)
 
     def _on_ptt_clicked(self) -> None:
         """Triggers Push-to-Talk audio recording and query execution."""
@@ -1419,7 +1597,7 @@ class WatchGuardDashboard:
             def update_ui():
                 self.item_voice_command.set_value(f"'{transcription}'", TEXT_PRIMARY)
                 self.lbl_voice_resp.set_text(response)
-            self.root.after(0, update_ui)
+            self._safe_dispatch_ui(update_ui)
 
         self.voice_assistant.listen_and_process(duration_seconds=3.5, on_complete=on_complete)
 
@@ -1428,15 +1606,36 @@ class WatchGuardDashboard:
         self.voice_assistant.mute_audio = self.mute_var.get()
 
     def _on_send_text_query(self) -> None:
-        """Executes text-query fallback."""
+        """Executes text-query fallback. Offloads to background thread when using external AI copilot."""
         query = self.ent_voice_query.get().strip()
         if not query:
             return
 
         self.item_voice_command.set_value(f"'{query}'", TEXT_PRIMARY)
-        response = self.voice_assistant.process_command(query)
-        self.lbl_voice_resp.set_text(response)
-        self.voice_assistant.speak(response)
+
+        use_async_copilot = (
+            self.voice_assistant
+            and hasattr(self.voice_assistant, "_should_use_ai_copilot")
+            and self.voice_assistant._should_use_ai_copilot(query)
+        )
+
+        if use_async_copilot:
+            self.lbl_voice_resp.set_text("Processing visual/voice query...")
+
+            def _worker():
+                response = self.voice_assistant.process_command(query)
+                def update_ui():
+                    if response:
+                        self.lbl_voice_resp.set_text(response)
+                        self.voice_assistant.speak(response)
+                self._safe_dispatch_ui(update_ui)
+
+            threading.Thread(target=_worker, daemon=True).start()
+        else:
+            response = self.voice_assistant.process_command(query)
+            if response:
+                self.lbl_voice_resp.set_text(response)
+                self.voice_assistant.speak(response)
 
     # --- Face Registration UI Dialog ---
 
@@ -1610,8 +1809,18 @@ class WatchGuardDashboard:
 
     def _schedule_event_pump(self) -> None:
         """Pumps events from background threads into the Tkinter UI safely."""
-        if self._is_closed:
+        if getattr(self, "_is_closed", False) or not hasattr(self, "root") or not self.root:
             return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+
+        # Cancel/discard previous timer ID before processing and rescheduling
+        if getattr(self, "_after_pump_id", None) is not None:
+            self._safe_after_cancel(self._after_pump_id)
+            self._after_pump_id = None
 
         while not self.event_queue.empty():
             try:
@@ -1620,12 +1829,11 @@ class WatchGuardDashboard:
                 self._update_event_count_stat()
             except queue.Empty:
                 break
-
-        if not self._is_closed:
-            try:
-                self._after_pump_id = self.root.after(100, self._schedule_event_pump)
             except Exception:
-                pass
+                break
+
+        if not getattr(self, "_is_closed", False):
+            self._after_pump_id = self._safe_after(100, self._schedule_event_pump)
 
     def _insert_event_to_tree(self, event: Dict[str, Any], prepend: bool = True) -> None:
         """Inserts an event row into the Treeview with formatted risk and high-contrast styling."""
@@ -1643,6 +1851,11 @@ class WatchGuardDashboard:
         if prepend:
             item = self.tree.insert("", 0, values=values, tags=(tag,))
             self.tree.see(item)
+            # Enforce live dashboard limit (display only newest MAX_RECENT_EVENTS_DISPLAY = 100 events)
+            children = self.tree.get_children()
+            if len(children) > MAX_RECENT_EVENTS_DISPLAY:
+                for old_item in children[MAX_RECENT_EVENTS_DISPLAY:]:
+                    self.tree.delete(old_item)
         else:
             self.tree.insert("", "end", values=values, tags=(tag,))
 
@@ -1662,6 +1875,128 @@ class WatchGuardDashboard:
         """Clears rows in the table UI."""
         for item in self.tree.get_children():
             self.tree.delete(item)
+
+    def _on_clear_event_history_clicked(self) -> None:
+        """Prompts confirmation dialog and clears security event history from SQLite database."""
+        confirm_dialog = tk.Toplevel(self.root)
+        confirm_dialog.title("Confirm Clear Event History")
+        confirm_dialog.geometry("440x190")
+        confirm_dialog.configure(bg=CARD_BG)
+        confirm_dialog.transient(self.root)
+        confirm_dialog.grab_set()
+        confirm_dialog.resizable(False, False)
+
+        try:
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 220
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 95
+            confirm_dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        lbl_title = tk.Label(
+            confirm_dialog,
+            text="⚠️  Clear Event History",
+            font=FONT_SUBTITLE,
+            bg=CARD_BG,
+            fg=COLOR_ORANGE,
+            padx=20,
+            pady=12,
+            anchor="w",
+        )
+        lbl_title.pack(fill="x")
+
+        msg_frame = tk.Frame(confirm_dialog, bg=CARD_BG, padx=20, pady=14)
+        msg_frame.pack(fill="both", expand=True)
+
+        lbl_msg = tk.Label(
+            msg_frame,
+            text="Clear all stored security event history?\nThis will permanently delete the selected event records from the database.",
+            font=FONT_BODY,
+            bg=CARD_BG,
+            fg=TEXT_PRIMARY,
+            justify="left",
+            wraplength=390,
+        )
+        lbl_msg.pack(fill="both", expand=True)
+
+        btn_bar = tk.Frame(confirm_dialog, bg=CARD_BG, padx=20, pady=10)
+        btn_bar.pack(fill="x")
+
+        def on_cancel():
+            confirm_dialog.destroy()
+
+        def on_confirm_clear():
+            confirm_dialog.destroy()
+            try:
+                # 1. Clear database history transactionally
+                deleted = self.db.clear_event_history(clear_incidents=True)
+                deleted_events_count = deleted.get("security_events", 0)
+
+                # 2. Drain any pending in-flight events from event_queue
+                while not self.event_queue.empty():
+                    try:
+                        self.event_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                # 3. Reset UI treeview display using canonical refresh mechanism
+                self._clear_treeview()
+                self._load_recent_events()
+
+                # 4. Reset in-memory edge-triggered state tracking so next event starts fresh
+                self._last_logged_security_state = None
+                self._consecutive_green_frames = 0
+
+                # 5. Reset in-memory incident manager state if present
+                if self.context_engine and getattr(self.context_engine, "incident_manager", None):
+                    try:
+                        self.context_engine.incident_manager.clear_active_incidents()
+                    except Exception as e:
+                        logger.warning(f"Error resetting active incidents: {e}")
+
+                # 6. Update UI status label with actual deleted database records count
+                self.lbl_table_status.configure(
+                    text=f"Event History Cleared ({deleted_events_count} Records)",
+                    fg=COLOR_GREEN,
+                )
+                logger.info(f"[DASHBOARD] Cleared event history from database: {deleted}")
+            except Exception as e:
+                logger.error(f"[DASHBOARD] Failed to clear event history: {e}", exc_info=True)
+                messagebox.showerror(
+                    "Database Error",
+                    f"Failed to clear event history: {e}",
+                    parent=self.root,
+                )
+
+        btn_cancel = tk.Button(
+            btn_bar,
+            text="Cancel",
+            font=FONT_BODY_BOLD,
+            bg=BTN_NEUTRAL_BG,
+            fg=TEXT_PRIMARY,
+            relief="flat",
+            padx=14,
+            pady=4,
+            cursor="hand2",
+            command=on_cancel,
+        )
+        btn_cancel.pack(side="right", padx=(8, 0))
+
+        btn_clear = tk.Button(
+            btn_bar,
+            text="Clear History",
+            font=FONT_BODY_BOLD,
+            bg="#DC2626",
+            fg="#FFFFFF",
+            activebackground="#B91C1C",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            padx=14,
+            pady=4,
+            cursor="hand2",
+            command=on_confirm_clear,
+        )
+        btn_clear.pack(side="right")
 
     def _update_event_count_stat(self) -> None:
         """Updates the total events telemetry number from SQLite database."""
@@ -1683,7 +2018,7 @@ class WatchGuardDashboard:
                         text=f"● LIVE (Camera #{device_index})",
                         fg=COLOR_GREEN,
                     )
-        self.root.after(0, update_ui)
+        self._safe_dispatch_ui(update_ui)
 
     # --- Camera & Simulation Actions ---
 
@@ -1701,7 +2036,6 @@ class WatchGuardDashboard:
                 text="● STREAM OFFLINE",
                 fg=TEXT_MUTED,
             )
-            self.lbl_fps.configure(text="FPS: 0.0")
             self.item_person.set_value("STANDBY", TEXT_MUTED)
             self.item_objects.set_value("STANDBY", TEXT_MUTED)
             self.item_liveness.set_value("STANDBY", TEXT_MUTED)
@@ -1710,6 +2044,8 @@ class WatchGuardDashboard:
             self.ctx_item_person.set_value("None", TEXT_MUTED)
             self.ctx_item_object.set_value("None", TEXT_MUTED)
             self.ctx_item_decision.set_value("STANDBY", TEXT_MUTED)
+            if hasattr(self, "ctx_item_ccsdf"):
+                self.ctx_item_ccsdf.set_value("STANDBY", TEXT_MUTED)
             self.lbl_ctx_reason.set_text("Camera inactive - Stream stopped.", fg=TEXT_MUTED)
             self._render_placeholder_frame("Camera Inactive - Click [Start Camera] below")
             self.logger.log_event(
@@ -1865,34 +2201,107 @@ class WatchGuardDashboard:
             description=f"Operator manually adjusted threat level to {level.label}",
         )
 
-    def _on_close(self) -> None:
-        """Clean shutdown handler."""
+    def close(self, destroy_root: bool = False) -> None:
+        """
+        Clean shutdown handler for dashboard UI, worker threads, and timers.
+        Guarantees deterministic resource release and callback cancellation.
+        """
+        if getattr(self, "_is_closed", False):
+            return
         self._is_closed = True
-        self._ai_stop_event.set()
-        self._ai_frame_event.set()
-        if self._after_video_id:
+
+        # 1. Disconnect external callbacks immediately so no new events/callbacks arrive
+        if hasattr(self, "logger") and self.logger:
             try:
-                self.root.after_cancel(self._after_video_id)
+                self.logger.unsubscribe(self._on_event_logged)
             except Exception:
                 pass
-        if self._after_ui_id:
+        if hasattr(self, "camera") and self.camera:
             try:
-                self.root.after_cancel(self._after_ui_id)
+                self.camera.set_on_device_selected_callback(None)
             except Exception:
                 pass
-        if self._after_pump_id:
+        if hasattr(self, "voice_assistant") and self.voice_assistant:
             try:
-                self.root.after_cancel(self._after_pump_id)
+                self.voice_assistant.set_status_callback(None)
             except Exception:
                 pass
-        if self.camera.is_running:
-            self.camera.stop()
-        if self._ai_worker_thread and self._ai_worker_thread.is_alive():
+
+        # 2. Stop AI worker thread cleanly
+        if hasattr(self, "_ai_stop_event"):
+            self._ai_stop_event.set()
+        if hasattr(self, "_ai_frame_event"):
+            self._ai_frame_event.set()
+
+        # 3. Cancel all pending after() callbacks atomically
+        if hasattr(self, "_active_after_ids") and hasattr(self, "root") and self.root:
+            for timer_id in list(self._active_after_ids):
+                try:
+                    self.root.after_cancel(timer_id)
+                except Exception:
+                    pass
+            self._active_after_ids.clear()
+
+        self._after_video_id = None
+        self._after_ui_id = None
+        self._after_pump_id = None
+
+        # 4. Stop camera if running
+        if hasattr(self, "camera") and self.camera and getattr(self.camera, "is_running", False):
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+
+        # 5. Join background AI worker thread
+        if hasattr(self, "_ai_worker_thread") and self._ai_worker_thread and self._ai_worker_thread.is_alive():
             try:
                 self._ai_worker_thread.join(timeout=0.5)
             except Exception:
                 pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+            self._ai_worker_thread = None
+
+        # 6. Restore winmm timer resolution on Windows if active
+        if getattr(self, "_winmm_period_set", False):
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeEndPeriod(1)
+                self._winmm_period_set = False
+            except Exception:
+                pass
+
+        # 7. Release cached images/references before root destruction
+        self._photo_image = None
+        if hasattr(self, "video_canvas") and self.video_canvas:
+            try:
+                self.video_canvas.delete("all")
+            except Exception:
+                pass
+
+        # 8. Cleanly delete Tk Variables while Tk interpreter is alive
+        for var_name in ["camera_index_var", "demo_target_var", "scenario_var", "mute_var", "threat_var"]:
+            if hasattr(self, var_name):
+                try:
+                    delattr(self, var_name)
+                except Exception:
+                    pass
+
+        # 9. Flush pending idletasks safely before teardown
+        if hasattr(self, "root") and self.root:
+            try:
+                if self.root.winfo_exists():
+                    self.root.update_idletasks()
+            except Exception:
+                pass
+
+        # 10. Optionally destroy root window if requested or invoked via WM_DELETE_WINDOW
+        if destroy_root and hasattr(self, "root") and self.root:
+            try:
+                if self.root.winfo_exists():
+                    self.root.destroy()
+            except Exception:
+                pass
+
+    def _on_close(self) -> None:
+        """Clean shutdown handler."""
+        self.close(destroy_root=True)
