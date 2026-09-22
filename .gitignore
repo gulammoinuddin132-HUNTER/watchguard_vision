@@ -3,10 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual environments
+# Virtual environments & local environment secrets
 .venv/
 venv/
 env/
+.env
+*.env
 
 # Runtime SQLite databases & local state
 *.db
