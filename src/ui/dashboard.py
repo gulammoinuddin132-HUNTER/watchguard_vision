@@ -138,6 +138,8 @@ class WatchGuardDashboard:
         self._canvas_img_id: Optional[int] = None
 
         # UI-only diagnostic line state (read-only display of already-available state)
+        # The header line is updated from the latest UI-visible snapshot, not only from
+        # construction-time engine state. That keeps it consistent with the rest of the UI.
         self._last_diag_text: Optional[str] = None
         self._ui_ready = False
         self._engine_person_ready = False
@@ -454,7 +456,8 @@ class WatchGuardDashboard:
         main_workspace.grid(row=1, column=0, sticky="nsew", padx=10, pady=(2, 4))
         main_workspace.grid_rowconfigure(0, weight=1)  # Row 0: UPPER_AREA absorbs vertical space (Camera dominates, zero bottom gap)
         main_workspace.grid_rowconfigure(1, weight=0)  # Row 1: CAMERA_CONTROLS_BAR (compact ~36-38px height)
-        main_workspace.grid_rowconfigure(2, weight=0, minsize=100)  # Row 2: VERY COMPACT EVENT LOG (~115-125px, sits at bottom)
+        main_workspace.grid_rowconfigure(2, weight=0, minsize=100)  # Row 2: EVENT LOG (~115-125px, sits near bottom)
+        main_workspace.grid_rowconfigure(3, weight=0, minsize=60)  # Row 3: OPTIONAL session info card slot (kept minimal)
         main_workspace.grid_columnconfigure(0, weight=1)
 
         # Row 0: Upper Section (Dominant Video Feed Left ~68-70% + Vertical Dashboard Right ~30-32%)
@@ -496,17 +499,18 @@ class WatchGuardDashboard:
         # Row 2: Real-time Event Feed (consumes all remaining height, minsize=240)
         self._build_event_feed(main_workspace)
 
-        # Optional read-only debug overlay (UI-only informational display)
+        # Optional read-only session info card (UI-only informational display)
         self._build_debug_overlay(main_workspace)
 
     def _build_debug_overlay(self, parent: tk.Frame) -> None:
-        """Builds a compact read-only debug/info overlay for live sessions.
+        """Builds a compact read-only session info card.
 
         This is purely informational and does not affect camera, AI, or event behavior.
-        It is intentionally kept minimal so it can be removed later without impact.
+        It is intentionally placed in its own geometry slot in main_workspace so it does not
+        overlap the event feed. The main workspace must reserve a small row for it.
         """
         card = CardFrame(parent, title="Session Info")
-        card.grid(row=2, column=0, sticky="ew", pady=(0, 2))
+        card.grid(row=3, column=0, sticky="ew", pady=(0, 2))
 
         content = tk.Frame(card, bg=CARD_BG, padx=4, pady=1)
         content.pack(fill="x")
@@ -1410,7 +1414,7 @@ class WatchGuardDashboard:
                         self.video_canvas.coords(self._canvas_img_id, x_off, y_off)
                         self.video_canvas.itemconfig(self._canvas_img_id, image=self._photo_image)
                 except Exception as render_err:
-                    logger.debug(f"[CAMERA RENDER] Exception during frame canvas render: {render_err}")
+                    logger.debug("[CAMERA RENDER] Exception during frame canvas render: %s", render_err)
 
                 # Track display FPS
                 self._display_frame_count += 1
@@ -1497,7 +1501,7 @@ class WatchGuardDashboard:
                 self._last_stream_status_fg = stat_fg
                 self.lbl_stream_status.configure(text=stat_text, fg=stat_fg)
 
-            # 6. Update read-only session info overlay (UI-only display)
+            # 6. Update read-only session info card (UI-only display, own layout row)
             if hasattr(self, "item_session_camera"):
                 try:
                     self._update_debug_overlay(state)
@@ -1728,7 +1732,7 @@ class WatchGuardDashboard:
                         "zone": ctx.get("zone_name", "Standard Perimeter"),
                         "current_time": ctx.get("time_str", "--:--"),
                         "authorized_hours_status": "NORMAL HOURS" if ctx.get("is_authorized_hours") else "AFTER HOURS",
-                        "authorized_hours_window": f"{self.context_engine.hours_start}–{self.context_engine.hours_end}",
+                        "authorized_hours_window": f"{self.context_engine.hours_start}-{self.context_engine.hours_end}",
                         "final_decision": decision.decision,
                         "risk_level": decision.risk_level.value,
                         "traceable_reason": decision.reason,
@@ -2494,6 +2498,8 @@ class WatchGuardDashboard:
                 pass
 
         # 10. Final UI-side idle reset (UI-only, best-effort, never blocks teardown)
+        # This runs AFTER Tk variables are released, so it must only touch widgets that
+        # already guard themselves against missing/closed state.
         try:
             self._reset_ui_to_idle()
         except Exception:
