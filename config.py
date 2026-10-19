@@ -151,11 +151,17 @@ CCSDF_WEIGHT_BEHAVIOR = float(os.getenv("CCSDF_WEIGHT_BEHAVIOR", "0.10"))
 DATABASE_PATH = DATA_DIR / "watchguard.db"
 
 # Camera Settings
+# NOTE ON ENVIRONMENT VARIABLES:
+# CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT, and CAMERA_HORIZONTAL_FLIP are read once
+# when this configuration module is imported at application startup.
+# Modifications require setting environment variables before launching or restarting
+# the application; changing them at runtime will not reconfigure an already running process.
 DEFAULT_CAMERA_INDEX = 0
-CAMERA_FRAME_WIDTH = 640
-CAMERA_FRAME_HEIGHT = 480
+CAMERA_FRAME_WIDTH = int(os.getenv("CAMERA_FRAME_WIDTH", "1280"))
+CAMERA_FRAME_HEIGHT = int(os.getenv("CAMERA_FRAME_HEIGHT", "720"))
 TARGET_FPS = 30
 CAMERA_WARMUP_FRAMES = 5
+CAMERA_HORIZONTAL_FLIP = os.getenv("CAMERA_HORIZONTAL_FLIP", "true").lower() in ("true", "1", "yes")
 
 # Event & Logging
 LOG_FILE_PATH = LOGS_DIR / "watchguard.log"

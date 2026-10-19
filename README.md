@@ -92,6 +92,11 @@ $$\text{Person Observation} + \text{Object Observation} + \text{Zone Context} + 
 - **Authorized Hours**: `09:00` to `18:00` (configurable 24h format)
 - **Spatial Proximity Threshold**: `150` pixels (edge-to-edge distance between bounding boxes)
 - **Alert Debounce Cooldown**: `15.0` seconds
+- **Camera Configuration & Environment Variables**:
+  - `CAMERA_FRAME_WIDTH` (default: `1280` — requested horizontal resolution)
+  - `CAMERA_FRAME_HEIGHT` (default: `720` — requested vertical resolution)
+  - `CAMERA_HORIZONTAL_FLIP` (default: `true` — flips physical webcam frames horizontally for true physical orientation)
+  - *Note:* These environment variables are evaluated when the Python configuration module loads at startup. Changes require setting the environment variables before launching or restarting the application; changing them does not automatically reconfigure an already running application.
 
 ---
 
