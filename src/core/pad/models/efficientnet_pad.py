@@ -8,7 +8,7 @@ Detects subtle screen moiré artifacts, color distortion, and reflection pattern
 import logging
 from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 

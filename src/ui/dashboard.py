@@ -17,7 +17,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 import cv2
 import logging
 import numpy as np
@@ -122,6 +122,9 @@ class WatchGuardDashboard:
         if not self.object_engine.is_ready:
             self.object_engine.initialize()
 
+        self._engine_person_ready = getattr(self.person_engine, "is_ready", False)
+        self._engine_object_ready = getattr(self.object_engine, "is_ready", False)
+
         # Connect Voice Assistant status listener
         self.voice_assistant.set_status_callback(self._on_voice_status_changed)
 
@@ -133,6 +136,14 @@ class WatchGuardDashboard:
         self.event_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
         self._photo_image: Optional[ImageTk.PhotoImage] = None
         self._canvas_img_id: Optional[int] = None
+
+        # UI-only diagnostic line state (read-only display of already-available state)
+        self._last_diag_text: Optional[str] = None
+        self._ui_ready = False
+        self._engine_person_ready = False
+        self._engine_object_ready = False
+        self._engine_context_ready = self.context_engine is not None
+        self._engine_voice_ready = self.voice_assistant is not None
 
         # Multi-Threaded Decoupled AI Worker & Display State (Phase 5.8)
         self._is_closed: bool = False
@@ -164,6 +175,7 @@ class WatchGuardDashboard:
         self._display_fps_timer: float = time.perf_counter()
         self._last_fps_str: str = ""
         self._last_stream_status_text: str = ""
+        self._last_stream_status_fg: str = TEXT_MUTED
         self._last_logged_security_state: Optional[Tuple[str, str, Optional[str], str]] = None
         self._consecutive_green_frames: int = 0
         self._last_render_dims: Tuple[int, int] = (640, 480)
@@ -215,6 +227,119 @@ class WatchGuardDashboard:
         # Handle window close cleanly
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Destroy>", self._on_destroy_event, add="+")
+
+        # Mark UI as live after the window is configured so the diagnostic line
+        # can safely reflect readiness instead of stale startup placeholders.
+        self._ui_ready = True
+        self._update_diag_line()
+
+    def _update_diag_line(self) -> None:
+        """Updates the compact header diagnostic line from current UI-visible state.
+
+        This is informational only and does not change any app behavior.
+        """
+        if not getattr(self, '_ui_ready', False):
+            return
+
+        parts: list[str] = []
+        if getattr(self, '_engine_person_ready', False):
+            parts.append("Face:ON")
+        else:
+            parts.append("Face:OFF")
+
+        if getattr(self, '_engine_object_ready', False):
+            parts.append("Obj:ON")
+        else:
+            parts.append("Obj:OFF")
+
+        camera = getattr(self, 'camera', None)
+        if camera is not None:
+            cam_mode = getattr(camera, 'demo_mode', 'none')
+            if getattr(camera, 'is_running', False):
+                cam_status = getattr(camera, 'status', None)
+                if cam_status == CameraStatus.REAL:
+                    parts.append(f"Cam#{getattr(camera, 'camera_index', 0)}")
+                elif cam_status == CameraStatus.SYNTHETIC:
+                    parts.append(f"Sim:{cam_mode.upper()}")
+                elif cam_status == CameraStatus.ERROR:
+                    parts.append("Cam:ERR")
+                else:
+                    parts.append("Cam:OFF")
+            else:
+                parts.append("Cam:OFF")
+        else:
+            parts.append("Cam:N/A")
+
+        if getattr(self, '_engine_context_ready', False):
+            parts.append("Ctx:ON")
+        else:
+            parts.append("Ctx:OFF")
+
+        scenario = self.scenario_var.get()
+        if scenario != "Standard Monitoring":
+            parts.append(f"Scen:{scenario.split('(')[-1].rstrip(')') if '(' in scenario else scenario}")
+
+        text = " | ".join(parts)
+        if text == getattr(self, '_last_diag_text', None):
+            return
+
+        self._last_diag_text = text
+        lbl = getattr(self, 'lbl_diag_status', None)
+        if lbl is not None and getattr(lbl, 'winfo_exists', lambda: False)():
+            if getattr(camera, 'status', None) == CameraStatus.ERROR:
+                fg = COLOR_RED
+            elif not getattr(self, '_engine_person_ready', False) or not getattr(self, '_engine_object_ready', False):
+                fg = TEXT_SECONDARY
+            else:
+                fg = TEXT_MUTED
+            lbl.configure(text=text, fg=fg)
+
+    def _reset_ui_to_idle(self) -> None:
+        """Resets the dashboard UI to a neutral idle state.
+
+        This is a UI-only helper used by camera stop/start transitions and shutdown.
+        It keeps label reset behavior consistent in one place instead of repeating it.
+        """
+        btn = getattr(self, 'btn_toggle_cam', None)
+        if btn is None:
+            return
+
+        btn.configure(
+            text="▶ START CAMERA",
+            bg=BTN_START_BG,
+            activebackground=COLOR_GREEN,
+        )
+        stream_lbl = getattr(self, 'lbl_stream_status', None)
+        if stream_lbl is not None:
+            stream_lbl.configure(
+                text="● STREAM OFFLINE",
+                fg=TEXT_MUTED,
+            )
+
+        for name, text in [
+            ('item_person', "STANDBY"),
+            ('item_objects', "STANDBY"),
+            ('item_liveness', "STANDBY"),
+            ('item_access', "STANDBY"),
+            ('item_pad_latency', "-- ms"),
+            ('ctx_item_person', "None"),
+            ('ctx_item_object', "None"),
+            ('ctx_item_decision', "STANDBY"),
+            ('lbl_ctx_reason', "Camera inactive - Stream stopped."),
+        ]:
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            if name == 'lbl_ctx_reason':
+                widget.set_text(text, fg=TEXT_MUTED)
+            else:
+                widget.set_value(text, TEXT_MUTED)
+
+        ccsdf = getattr(self, 'ctx_item_ccsdf', None)
+        if ccsdf is not None:
+            ccsdf.set_value("STANDBY", TEXT_MUTED)
+
+        self._update_diag_line()
 
     def _safe_after(self, delay_ms: int, callback: Callable) -> Optional[str]:
         """Schedules a timer callback and tracks its ID for deterministic cancellation."""
@@ -371,8 +496,83 @@ class WatchGuardDashboard:
         # Row 2: Real-time Event Feed (consumes all remaining height, minsize=240)
         self._build_event_feed(main_workspace)
 
+        # Optional read-only debug overlay (UI-only informational display)
+        self._build_debug_overlay(main_workspace)
+
+    def _build_debug_overlay(self, parent: tk.Frame) -> None:
+        """Builds a compact read-only debug/info overlay for live sessions.
+
+        This is purely informational and does not affect camera, AI, or event behavior.
+        It is intentionally kept minimal so it can be removed later without impact.
+        """
+        card = CardFrame(parent, title="Session Info")
+        card.grid(row=2, column=0, sticky="ew", pady=(0, 2))
+
+        content = tk.Frame(card, bg=CARD_BG, padx=4, pady=1)
+        content.pack(fill="x")
+
+        self.item_session_camera = TelemetryItem(content, "Camera:", "Offline")
+        self.item_session_camera.pack(side="left", fill="x", expand=True, padx=(0, 3))
+
+        self.item_session_mode = TelemetryItem(content, "Mode:", "--")
+        self.item_session_mode.pack(side="left", fill="x", expand=True, padx=(3, 3))
+
+        self.item_session_scenario = TelemetryItem(content, "Scenario:", "Standard")
+        self.item_session_scenario.pack(side="left", fill="x", expand=True, padx=(3, 3))
+
+        self.item_session_fps = TelemetryItem(content, "Display FPS:", "0.0")
+        self.item_session_fps.pack(side="right", fill="x", expand=True)
+
+        # Initial offline state to match early lifecycle before first UI update
+        self.item_session_camera.set_value("Offline", TEXT_SECONDARY)
+        self.item_session_mode.set_value("--", TEXT_SECONDARY)
+        self.item_session_scenario.set_value("Standard", TEXT_SECONDARY)
+        self.item_session_fps.set_value("0.0", TEXT_SECONDARY)
+
+    def _update_debug_overlay(self, state: Dict[str, Any]) -> None:
+        """Updates the session info card from the latest UI-visible state snapshot.
+
+        Read-only display of state the dashboard already consumes elsewhere.
+        """
+        cam_status = state.get("camera_status")
+        cam_idx = state.get("camera_index", 0)
+        demo_m = state.get("demo_mode", "none")
+
+        if cam_status == CameraStatus.REAL:
+            cam_text = f"#{cam_idx} Live"
+            mode_text = "Physical"
+        elif cam_status == CameraStatus.SYNTHETIC:
+            cam_text = f"#{cam_idx} Sim"
+            mode_text = demo_m.title() if demo_m else "Simulation"
+        elif cam_status == CameraStatus.ERROR:
+            cam_text = f"#{cam_idx} Error"
+            mode_text = "Error"
+        else:
+            cam_text = "Offline"
+            mode_text = "--"
+
+        cam_widget = getattr(self, 'item_session_camera', None)
+        if cam_widget is not None:
+            cam_widget.set_value(cam_text, TEXT_PRIMARY)
+
+        mode_widget = getattr(self, 'item_session_mode', None)
+        if mode_widget is not None:
+            mode_widget.set_value(mode_text, TEXT_SECONDARY)
+
+        scenario_widget = getattr(self, 'item_session_scenario', None)
+        if scenario_widget is not None:
+            scenario_widget.set_value(
+                self.scenario_var.get(),
+                TEXT_SECONDARY,
+            )
+
+        fps_widget = getattr(self, 'item_session_fps', None)
+        if fps_widget is not None:
+            disp_fps = self._display_fps if self._display_fps > 0 else state.get("fps", 0.0)
+            fps_widget.set_value(f"{disp_fps:.1f}", ACCENT_BLUE)
+
     def _build_header_bar(self) -> None:
-        """Builds top brand / status header."""
+        """Builds top brand bar with a live system status line."""
         header = tk.Frame(self.root, bg=CARD_HEADER_BG, height=40, padx=14)
         header.grid(row=0, column=0, sticky="ew")
         header.pack_propagate(False)
@@ -408,10 +608,21 @@ class WatchGuardDashboard:
         )
         lbl_tag.pack(side="left", padx=(8, 0), pady=(3, 0))
 
-        # Right status indicator
+        # Right status area: compact system line + compact stream indicator
         sys_status_frame = tk.Frame(header, bg=CARD_HEADER_BG)
         sys_status_frame.pack(side="right", fill="y")
 
+        # Compact diagnostic / info line (UI-only state display, read-only)
+        self.lbl_diag_status = tk.Label(
+            sys_status_frame,
+            text="UI READY",
+            font=FONT_SMALL,
+            bg=CARD_HEADER_BG,
+            fg=TEXT_MUTED,
+        )
+        self.lbl_diag_status.pack(side="right", padx=(0, 6), pady=8)
+
+        # Stream / connection indicator (kept from original behavior)
         self.lbl_stream_status = tk.Label(
             sys_status_frame,
             text="● STREAM OFFLINE",
@@ -419,7 +630,7 @@ class WatchGuardDashboard:
             bg=CARD_HEADER_BG,
             fg=TEXT_MUTED,
         )
-        self.lbl_stream_status.pack(side="right", pady=9)
+        self.lbl_stream_status.pack(side="right", pady=8)
 
     def _build_video_card(self, parent: tk.Frame) -> None:
         """Builds the main video frame viewport inside the upper area."""
@@ -1236,18 +1447,18 @@ class WatchGuardDashboard:
             self._after_ui_id = None
 
         state = self._latest_vision_state
-        if state is not None and self.camera.is_running:
-            # 1. Update Object Detection Telemetry
-            self._handle_object_detection_telemetry(state["obj_results"])
-
-            # 2. Update Person Recognition Telemetry
-            self._handle_person_recognition_telemetry(state["person_results"])
-
-            # 3. Update Context Decision
-            if state["decision"] is not None:
-                self._handle_context_decision(state["decision"])
-
         if state is not None:
+            # 1. Update Object Detection Telemetry
+            if self.camera.is_running:
+                self._handle_object_detection_telemetry(state["obj_results"])
+
+                # 2. Update Person Recognition Telemetry
+                self._handle_person_recognition_telemetry(state["person_results"])
+
+                # 3. Update Context Decision
+                if state["decision"] is not None:
+                    self._handle_context_decision(state["decision"])
+
             # 4. Update FPS label with change-caching
             if self.camera.is_running:
                 disp_fps = self._display_fps if self._display_fps > 0 else state.get("fps", 0.0)
@@ -1285,6 +1496,13 @@ class WatchGuardDashboard:
                 self._last_stream_status_text = stat_text
                 self._last_stream_status_fg = stat_fg
                 self.lbl_stream_status.configure(text=stat_text, fg=stat_fg)
+
+            # 6. Update read-only session info overlay (UI-only display)
+            if hasattr(self, "item_session_camera"):
+                try:
+                    self._update_debug_overlay(state)
+                except Exception:
+                    pass
 
         # Re-schedule next decoupled UI update loop (100ms = 10 Hz)
         if not getattr(self, "_is_closed", False):
@@ -2027,26 +2245,7 @@ class WatchGuardDashboard:
         if self.camera.is_running and self.camera.status in (CameraStatus.REAL, CameraStatus.SYNTHETIC):
             # 1. Clean stop requested by operator
             self.camera.stop()
-            self.btn_toggle_cam.configure(
-                text="▶ START CAMERA",
-                bg=BTN_START_BG,
-                activebackground=COLOR_GREEN,
-            )
-            self.lbl_stream_status.configure(
-                text="● STREAM OFFLINE",
-                fg=TEXT_MUTED,
-            )
-            self.item_person.set_value("STANDBY", TEXT_MUTED)
-            self.item_objects.set_value("STANDBY", TEXT_MUTED)
-            self.item_liveness.set_value("STANDBY", TEXT_MUTED)
-            self.item_access.set_value("STANDBY", TEXT_MUTED)
-            self.item_pad_latency.set_value("-- ms", TEXT_MUTED)
-            self.ctx_item_person.set_value("None", TEXT_MUTED)
-            self.ctx_item_object.set_value("None", TEXT_MUTED)
-            self.ctx_item_decision.set_value("STANDBY", TEXT_MUTED)
-            if hasattr(self, "ctx_item_ccsdf"):
-                self.ctx_item_ccsdf.set_value("STANDBY", TEXT_MUTED)
-            self.lbl_ctx_reason.set_text("Camera inactive - Stream stopped.", fg=TEXT_MUTED)
+            self._reset_ui_to_idle()
             self._render_placeholder_frame("Camera Inactive - Click [Start Camera] below")
             self.logger.log_event(
                 event_type=EventType.CAMERA_STOPPED,
@@ -2294,7 +2493,13 @@ class WatchGuardDashboard:
             except Exception:
                 pass
 
-        # 10. Optionally destroy root window if requested or invoked via WM_DELETE_WINDOW
+        # 10. Final UI-side idle reset (UI-only, best-effort, never blocks teardown)
+        try:
+            self._reset_ui_to_idle()
+        except Exception:
+            pass
+
+        # 11. Optionally destroy root window if requested or invoked via WM_DELETE_WINDOW
         if destroy_root and hasattr(self, "root") and self.root:
             try:
                 if self.root.winfo_exists():

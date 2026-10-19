@@ -8,7 +8,7 @@ Enforces critical safety invariants preventing low confidence from granting fals
 
 import math
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import logging
 
 from config import (
