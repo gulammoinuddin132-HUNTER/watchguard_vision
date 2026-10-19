@@ -43,3 +43,6 @@ htmlcov/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Local tool/runtime data
+.freebuff/
