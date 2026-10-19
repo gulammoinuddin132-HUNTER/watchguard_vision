@@ -34,7 +34,7 @@ watchguard_vision/
 │   └── logs/                   # System runtime logs (watchguard.log)
 ├── src/
 │   ├── camera/                 # Video stream management
-│   │   └── camera_manager.py   # Multi-index physical camera discovery, dynamic FPS, fallback simulation
+│   │   └── camera_manager.py   # Multi-index physical discovery, 16:9 widescreen (1280x720), mirror correction & simulation
 │   ├── database/               # Data persistence layer
 │   │   ├── db_manager.py       # SQLite connection manager, face & object CRUD
 │   │   └── models.py           # Structured dataclasses for records
@@ -56,7 +56,7 @@ watchguard_vision/
 ├── tests/                      # Automated unit test suite
 │   ├── test_database.py        # Database schema and CRUD tests
 │   ├── test_event_logger.py    # Event logger and subscriber tests
-│   ├── test_camera.py          # Camera manager lifecycle and fallback tests
+│   ├── test_camera.py          # Camera lifecycle, horizontal flip, resolution scaling & fallback tests
 │   ├── test_person_recognition.py # Person recognition, registration, throttling & demo tests
 │   ├── test_object_detection.py # YOLOv8n object detection, NMS, throttling & DB persistence tests
 │   ├── test_context_engine.py  # Security rules (A-F), spatial proximity, time & debouncing tests
@@ -92,6 +92,11 @@ $$\text{Person Observation} + \text{Object Observation} + \text{Zone Context} + 
 - **Authorized Hours**: `09:00` to `18:00` (configurable 24h format)
 - **Spatial Proximity Threshold**: `150` pixels (edge-to-edge distance between bounding boxes)
 - **Alert Debounce Cooldown**: `15.0` seconds
+- **Camera Configuration & Environment Variables**:
+  - `CAMERA_FRAME_WIDTH` (default: `1280` — requested horizontal resolution)
+  - `CAMERA_FRAME_HEIGHT` (default: `720` — requested vertical resolution)
+  - `CAMERA_HORIZONTAL_FLIP` (default: `true` — flips physical webcam frames horizontally for true physical orientation)
+  - *Note:* These environment variables are evaluated when the Python configuration module loads at startup. Changes require setting the environment variables before launching or restarting the application; changing them does not automatically reconfigure an already running application.
 
 ---
 
@@ -117,8 +122,12 @@ cd watchguard_vision
 .venv\Scripts\python.exe main.py
 ```
 
-### 2. Run All Automated Tests
+### 2. Run Automated Tests
 ```bash
+# Run camera and flip-validation tests
+.venv\Scripts\python.exe -m unittest tests/test_camera.py
+
+# Run all automated tests
 .venv\Scripts\python.exe -m unittest discover tests
 ```
 
@@ -127,7 +136,7 @@ cd watchguard_vision
 ## 🎯 Testing Context Scenarios with the Real Webcam
 
 1. Run `.venv\Scripts\python.exe main.py`.
-2. Click **`▶ START CAMERA`** on the bottom control bar (connects to Device `#0` HP Wide Vision HD Camera).
+2. Click **`▶ START CAMERA`** on the bottom control bar (connects to Device `#0` in 1280×720 widescreen with physical mirror correction).
 3. **Test Scenario 1 (Normal Operations - Rule A)**:
    - When the camera sees your registered face, the system reports `Risk: GREEN`, `Decision: NORMAL_ACTIVITY`, and shows Emerald Green badges.
 4. **Test Scenario 2 (Unknown Person Near Protected Asset - Rule C)**:
@@ -138,5 +147,6 @@ cd watchguard_vision
    - In the **Scenario:** dropdown at the bottom, select **`Simulate After-Hours (22:30)`**.
    - When an authorized person interacts with a protected asset (laptop/phone), the system flags **`ORANGE [HIGH RISK]`** with reason `"After-hours asset activity: Authorized user interacting with LAPTOP outside authorized hours (22:30)"`.
 6. **Test Scenario 4 (Restricted Zone - Rule E / F)**:
-   - Select **`Force Restricted Zone`** from the Scenario dropdown:
+   - Select **`Force Restricted Zone`** from the Scenario dropdown, or walk physically toward the right side of the camera's field of view:
+   - The live feed matches real-world physical orientation without horizontal inversion, correctly aligning your physical position with the restricted perimeter.
    - Instantly shows the red tint on the restricted perimeter and triggers **`ORANGE`** or **`RED`** depending on authorization.
