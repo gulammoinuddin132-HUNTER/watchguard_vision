@@ -219,4 +219,4 @@ watchguard_vision/
 
 ---
 
-*This guide documents the current WatchGuard Vision prototype features as implemented in the codebase. For development and test details, see `README.md`.*
+
