@@ -27,6 +27,7 @@ from config import (
     TARGET_FPS,
     EVIDENCE_DIR,
     DEMO_FACES_DIR,
+    CAMERA_HORIZONTAL_FLIP,
 )
 
 logger = logging.getLogger("WatchGuardVision.Camera")
@@ -49,8 +50,13 @@ class CameraMode(Enum):
 class CameraManager:
     """Threaded OpenCV Camera Manager for WatchGuard Vision."""
 
-    def __init__(self, camera_index: int = DEFAULT_CAMERA_INDEX):
+    def __init__(
+        self,
+        camera_index: int = DEFAULT_CAMERA_INDEX,
+        horizontal_flip: bool = CAMERA_HORIZONTAL_FLIP,
+    ):
         self.camera_index = camera_index
+        self.horizontal_flip = horizontal_flip
         self.actual_resolution: Tuple[int, int] = (CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT)
         self._cap: Optional[cv2.VideoCapture] = None
         self._thread: Optional[threading.Thread] = None
@@ -278,6 +284,8 @@ class CameraManager:
                         self._status = CameraStatus.REAL
                         self._error_message = None
                         self._consecutive_drops = 0
+                        if self.horizontal_flip:
+                            frame = cv2.flip(frame, 1)
                         with self._lock:
                             self._latest_frame = frame.copy()
 
@@ -314,6 +322,8 @@ class CameraManager:
             self._status = CameraStatus.REAL
             self._error_message = None
             self._consecutive_drops = 0
+            if self.horizontal_flip:
+                frame = cv2.flip(frame, 1)
             with self._lock:
                 self._latest_frame = frame.copy()
 
@@ -485,6 +495,8 @@ class CameraManager:
                 ret, frame = self._cap.read()
                 if ret and frame is not None and frame.size > 0:
                     self._consecutive_drops = 0
+                    if self.horizontal_flip:
+                        frame = cv2.flip(frame, 1)
                     captured_frame = frame
                 else:
                     self._consecutive_drops += 1

@@ -6,6 +6,7 @@ for WatchGuard Vision.
 """
 
 import logging
+import queue
 import shutil
 import sqlite3
 import threading
@@ -13,6 +14,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Generator
+from src.database.azure_sql import AzureSQLSync
+from src.database.azure_blob import AzureBlobSync
 
 logger = logging.getLogger("WatchGuardVision.DatabaseManager")
 
@@ -46,6 +49,60 @@ class DatabaseManager:
         self._lock = threading.RLock()
         self._event_insert_counter: int = 0
         self._initialize_schema()
+        # Optional cloud layers. SQLite remains the primary/local database.
+        self.azure_sql = AzureSQLSync()
+        self.azure_blob = AzureBlobSync()
+        # Asynchronous Cloud synchronization queue & background worker
+        self._cloud_sync_queue: queue.Queue = queue.Queue()
+        self._cloud_worker_thread: Optional[threading.Thread] = None
+        if self.azure_sql.enabled or self.azure_blob.enabled:
+            self._cloud_worker_thread = threading.Thread(
+                target=self._cloud_sync_worker,
+                name="WatchGuard-CloudSyncWorker",
+                daemon=True,
+            )
+            self._cloud_worker_thread.start()
+
+    def _cloud_sync_worker(self) -> None:
+        """Background worker thread consuming cloud synchronization jobs without blocking the main UI loop."""
+        while True:
+            try:
+                task = self._cloud_sync_queue.get()
+                if task is None:
+                    break
+                event_id, event_type, risk_level, description, evidence_frame_path, person_name, object_summary, metadata_json, ts = task
+
+                if self.azure_sql.enabled:
+                    try:
+                        self.azure_sql.sync_security_event(
+                            local_event_id=event_id,
+                            event_type=event_type,
+                            risk_level=risk_level,
+                            description=description,
+                            evidence_frame_path=evidence_frame_path,
+                            person_name=person_name,
+                            object_summary=object_summary,
+                            metadata_json=metadata_json,
+                            timestamp=ts,
+                        )
+                    except Exception as exc:
+                        logger.warning("[AZURE SQL] Background event sync failed: %s", exc)
+
+                if self.azure_blob.enabled:
+                    try:
+                        blob_url = self.azure_blob.upload_evidence(
+                            local_path=evidence_frame_path,
+                            event_id=event_id,
+                            risk_level=risk_level,
+                            event_type=event_type,
+                        )
+                        if blob_url:
+                            logger.info("[AZURE BLOB] Background evidence uploaded: %s", blob_url)
+                    except Exception as exc:
+                        logger.warning("[AZURE BLOB] Background evidence upload failed: %s", exc)
+                self._cloud_sync_queue.task_done()
+            except Exception as e:
+                logger.error("[CLOUD SYNC WORKER] Unexpected error in worker loop: %s", e)
 
     @contextmanager
     def _connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -239,6 +296,20 @@ class DatabaseManager:
                 )
                 conn.commit()
                 event_id = cursor.lastrowid
+
+            # Cloud sync is dispatched asynchronously to prevent UI event loop stalls
+            if hasattr(self, "_cloud_sync_queue") and (self.azure_sql.enabled or self.azure_blob.enabled):
+                self._cloud_sync_queue.put((
+                    event_id,
+                    event_type,
+                    risk_level,
+                    description,
+                    evidence_frame_path,
+                    person_name,
+                    object_summary,
+                    metadata_json,
+                    ts,
+                ))
 
             # Periodic non-critical event retention check (throttled by insert interval, never per-frame)
             self._event_insert_counter += 1
